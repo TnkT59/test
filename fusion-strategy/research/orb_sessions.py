@@ -277,7 +277,8 @@ def _ny_roll_between(t0: int, t1: int) -> bool:
 
 
 def simulate_session(bars: Bars, sym: str, sess: Session, days,
-                     costs: bool = True, stress: bool = False, use_stop: bool = True):
+                     costs: bool = True, stress: bool = False, use_stop: bool = True,
+                     target_mult: float = 1.0):
     """Return (trades, stats). Trades are dicts in chronological order; sizing
     is applied later. stats counts days skipped for missing range bars, and
     positions still open when the data ends before the session exit (those
@@ -285,7 +286,10 @@ def simulate_session(bars: Bars, sym: str, sess: Session, days,
 
     use_stop=False is a what-if only (it breaks the plan's hard rule): the
     stop is never triggered and trades exit at the target or session exit.
-    Position size is unchanged, so R is still measured on the stop distance."""
+    Position size is unchanged, so R is still measured on the stop distance.
+
+    target_mult sets the target distance as a multiple of the range
+    (default 1.0, the original rule)."""
     spec = SPEC[sym]
     slip = spec["slip"] if costs else 0.0
     extra = spec["slip"] if stress else 0.0
@@ -320,12 +324,12 @@ def simulate_session(bars: Bars, sym: str, sess: Session, days,
                 short_hit = l <= lo
                 if long_hit:          # both in one bar -> long first, then stop check
                     pos, entry = 1, max(hi, o + sp) + slip
-                    stop, target = lo, hi + rng
+                    stop, target = lo, hi + target_mult * rng
                     if entry >= target:
                         target = math.inf
                 elif short_hit:
                     pos, entry = -1, min(lo, o) - slip
-                    stop, target = hi, lo - rng
+                    stop, target = hi, lo - target_mult * rng
                     if entry <= target:
                         target = -math.inf
                 else:
@@ -612,7 +616,7 @@ def _plot(trades: pd.DataFrame, path: pathlib.Path, label: str = "") -> None:
 
 def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | None,
         server_tz: str | None, risks: tuple[float, ...] = (),
-        use_stop: bool = True) -> pd.DataFrame:
+        use_stop: bool = True, target_mult: float = 1.0) -> pd.DataFrame:
     out_dir.mkdir(parents=True, exist_ok=True)
     files: dict[str, list[pathlib.Path]] = {}
     for f in sorted(data_dir.glob("*.csv")):
@@ -648,7 +652,7 @@ def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | No
             days = trading_days(df, sess)
             for label, costs, stress in CASES:
                 tr, st = simulate_session(bars, sym, sess, days, costs=costs, stress=stress,
-                                          use_stop=use_stop)
+                                          use_stop=use_stop, target_mult=target_mult)
                 scored = size_and_score(tr, sym, costs=costs)
                 m = metrics(scored, *span)
                 rows.append(dict(symbol=sym, session=sess.name, case=label,
@@ -685,13 +689,16 @@ def main(argv=None) -> None:
     p.add_argument("--end", default=None)
     p.add_argument("--risks", default="",
                    help="comma-separated risk per trade for an equity what-if, e.g. 0.005,0.01")
+    p.add_argument("--target-mult", type=float, default=1.0,
+                   help="target distance as a multiple of the range (default 1.0)")
     p.add_argument("--no-stop", action="store_true",
                    help="what-if only: never trigger the stop (breaks the plan's hard rule)")
     p.add_argument("--server-tz", default=None,
                    help="override detection, e.g. NY+7, Europe/Helsinki, Etc/GMT-2")
     a = p.parse_args(argv)
     risks = tuple(float(x) for x in a.risks.split(",") if x.strip())
-    res = run(a.data, a.out, a.start, a.end, a.server_tz, risks, use_stop=not a.no_stop)
+    res = run(a.data, a.out, a.start, a.end, a.server_tz, risks, use_stop=not a.no_stop,
+              target_mult=a.target_mult)
     pd.set_option("display.width", 250)
     print(res.round(3).to_string(index=False))
 
