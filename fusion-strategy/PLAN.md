@@ -1,6 +1,6 @@
 # Fusion Strategy: Plan (Phase 0)
 
-Status: **DRAFT. Waiting for approval.** Nothing below Phase 0 has been built or run.
+Status: **Approved 2026-10-14 with all defaults (Q1–Q7).** Phase 1 has not run: Dukascopy blocks this container, and the paid S3 route was declined. See §11.
 
 Instruments: XAUUSD, EURUSD, GBPUSD, USDJPY. Timeframes: M15, H1, H4, D1.
 Execution targets: Python research and backtest first, then the MQL5 EA, then a demo runner. **No live account, ever.**
@@ -196,3 +196,11 @@ Count: 8 × 4 + 1 + 4 × 2 + 1 = **42 strategy-timeframe cells × 4 symbols = 16
 - Phase 6, if the trade match is < 90%.
 - Any phase that fails twice.
 - Before: new dependencies, deleting files, changing splits, risk > 0.5%, or anything involving a live account.
+
+## 11. Change log
+
+- **2026-10-17. Exploratory ORB test, outside Phases 1–7.** On your request, `research/orb_sessions.py` tests a 30-minute opening-range breakout on the Tokyo, London and New York sessions for all 4 symbols.
+  - **Data:** M1 bars exported from your MT5 demo terminal, instead of Dukascopy. MT5 bars are bid-only and carry one spread value per bar, reportedly the bar's *minimum* spread, so a 2× spread stress case is reported alongside.
+  - **Period: 2023-01-01 to the end of the data, as one block, on your instruction.** This overlaps the 2025+ holdout. **The holdout is no longer clean for any strategy that includes an ORB or session-breakout component (S1, S2 or this test).** Phase 5 must state this if such a component reaches the final strategy.
+  - **Sessions:** these are not the same as S1/S2 in §4.5. Each session uses its own first 30 minutes as the range: Tokyo 09:00–09:30 JST, London 08:00–08:30, New York 08:00–08:30 local time. Exits are at 15:00 JST, 16:00 London and 16:00 NY.
+
