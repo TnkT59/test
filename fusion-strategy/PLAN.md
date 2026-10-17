@@ -229,4 +229,9 @@ Count: 8 × 4 + 1 + 4 × 2 + 1 = **42 strategy-timeframe cells × 4 symbols = 16
   - T2 gains the 55-day failsafe entry from the original Turtle rules, which this plan had left out.
   - M1 closes and reopens every month.
   - Orders and positions now carry clock deadlines, so holiday early closes (32 days for XAUUSD in 2023–26) cannot carry an order or a position into the next day.
+- **2026-10-18. Phase 3 engine and data route.**
+  - **Data:** Dukascopy stays blocked from the cloud session, so Phase 3 will use MT5 M15 exports from your broker, 2015 → 2024, for XAUUSD, EURUSD, GBPUSD and USDJPY. MT5 bars are bid bars with one spread value per bar, and the engine estimates the ask conservatively (see `research/orb_sessions/README.md`).
+  - **Resolution:** intrabar events are resolved on M15 rather than M1. The measured bias is −0.006 to −0.008R per trade, so it is slightly pessimistic.
+  - **Swap:** the swap table in `config/costs.toml` must be filled from your broker's Symbol → Specification before Phase 3 runs. The runner stops otherwise.
+  - **Config format:** `config/*.yaml` became `config/costs.toml`, because PyYAML is not an allowed dependency and Python reads TOML natively.
 
