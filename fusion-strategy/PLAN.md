@@ -221,4 +221,8 @@ Count: 8 × 4 + 1 + 4 × 2 + 1 = **42 strategy-timeframe cells × 4 symbols = 16
   - The ORB was rerun with the take-profit at 0.5× and at 2× the range, with the stop kept.
   - No combination passes the gate. See `results/orb_sessions_targets.md`.
   - ORB variants tried so far: 48 (12 combinations × 4 rule sets).
+- **2026-10-17. Partial take-profit what-if, at your request.**
+  - Half the position closes at 0.5× the range and the rest runs to 2×, with the stop kept and no move to breakeven.
+  - No combination passes the gate. See `results/orb_sessions_targets.md`.
+  - ORB variants tried so far: 60.
 

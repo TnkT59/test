@@ -385,6 +385,29 @@ def _first_bar(trades: pd.DataFrame, bar_min: int) -> pd.Series:
     return trades.mins_after_range < bar_min
 
 
+def merge_legs(per_leg: list[list[dict]], shares: tuple[float, ...]) -> tuple[list[dict], int]:
+    """Combine simulations of the same entries with different targets into one
+    trade per day with partial exits: leg i closes shares[i] of the position at
+    its own target (or stop / session exit). Entries, stop and size do not
+    depend on the target, which is asserted. Days missing from any leg
+    (position still open when the data ends) are dropped and counted."""
+    maps = [{t["day"]: t for t in leg} for leg in per_leg]
+    days = [d for d in maps[0] if all(d in m for m in maps[1:])]
+    dropped = max(len(m) for m in maps) - len(days)
+    out = []
+    for day in days:
+        parts = [m[day] for m in maps]
+        key = lambda t: (t["dir"], t["entry"], t["t_in"], t["stop"], t["level"], t["plan_dist"])
+        assert all(key(p) == key(parts[0]) for p in parts), f"legs disagree on entry {day}"
+        legs = [dict(share=w, exit=p["exit"], reason=p["reason"], t_out=p["t_out"])
+                for w, p in zip(shares, parts)]
+        out.append({**parts[0], "legs": legs,
+                    "exit": sum(l["share"] * l["exit"] for l in legs),
+                    "t_out": max(l["t_out"] for l in legs),
+                    "reason": "+".join(l["reason"] for l in legs)})
+    return out, dropped
+
+
 def size_and_score(trades: list[dict], sym: str, costs: bool = True,
                    risk_pct: float = RISK_PCT) -> pd.DataFrame:
     """Size each trade before its fill (on the order level and the planned
@@ -404,11 +427,15 @@ def size_and_score(trades: list[dict], sym: str, costs: bool = True,
         if capped:
             units = spec["max_lev"] * eq / per_unit_notional
         step = spec["lot"] * 0.01
-        units = math.floor(units / step + 1e-9) * step
+        legs = tr.get("legs") or [dict(share=1.0, exit=tr["exit"])]
+        leg_units = [math.floor(l["share"] * units / step + 1e-9) * step for l in legs]
+        units = sum(leg_units)
         if units <= 0:
             continue
-        pnl = tr["dir"] * (tr["exit"] - tr["entry"]) * units
-        pnl_usd = pnl / tr["exit"] if sym == "USDJPY" else pnl
+        pnl_usd = 0.0
+        for l, u in zip(legs, leg_units):
+            pnl = tr["dir"] * (l["exit"] - tr["entry"]) * u
+            pnl_usd += pnl / l["exit"] if sym == "USDJPY" else pnl
         if costs:
             if sym in NOTIONAL_COMMISSION:
                 comm = COMMISSION_PER_100K_NOTIONAL * units * tr["entry"] / 100_000
@@ -420,7 +447,8 @@ def size_and_score(trades: list[dict], sym: str, costs: bool = True,
         risk_usd = units * plan_usd
         eq_before = eq
         eq += net
-        rows.append({**tr, "units": units, "lots": units / spec["lot"], "capped": capped,
+        rows.append({**{k: v for k, v in tr.items() if k != "legs"},
+                     "units": units, "lots": units / spec["lot"], "capped": capped,
                      "commission": comm, "pnl_usd": net, "risk_usd": risk_usd,
                      "R": net / risk_usd, "risk_pct_actual": risk_usd / eq_before,
                      "equity_before": eq_before, "equity": eq})
@@ -616,7 +644,10 @@ def _plot(trades: pd.DataFrame, path: pathlib.Path, label: str = "") -> None:
 
 def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | None,
         server_tz: str | None, risks: tuple[float, ...] = (),
-        use_stop: bool = True, target_mult: float = 1.0) -> pd.DataFrame:
+        use_stop: bool = True, target_mult: float = 1.0,
+        partial: tuple[tuple[float, float], ...] = ()) -> pd.DataFrame:
+    """partial: ((share, target_mult), ...) closes each share of the position
+    at its own target multiple, e.g. ((0.5, 0.5), (0.5, 2.0))."""
     out_dir.mkdir(parents=True, exist_ok=True)
     files: dict[str, list[pathlib.Path]] = {}
     for f in sorted(data_dir.glob("*.csv")):
@@ -651,8 +682,16 @@ def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | No
         for sess in sessions_for(sym):
             days = trading_days(df, sess)
             for label, costs, stress in CASES:
-                tr, st = simulate_session(bars, sym, sess, days, costs=costs, stress=stress,
-                                          use_stop=use_stop, target_mult=target_mult)
+                if partial:
+                    sims = [simulate_session(bars, sym, sess, days, costs=costs, stress=stress,
+                                             use_stop=use_stop, target_mult=mult)
+                            for _, mult in partial]
+                    tr, dropped = merge_legs([t for t, _ in sims], tuple(w for w, _ in partial))
+                    st = dict(sims[0][1])
+                    st["incomplete"] = max(x[1]["incomplete"] for x in sims) + dropped
+                else:
+                    tr, st = simulate_session(bars, sym, sess, days, costs=costs, stress=stress,
+                                              use_stop=use_stop, target_mult=target_mult)
                 scored = size_and_score(tr, sym, costs=costs)
                 m = metrics(scored, *span)
                 rows.append(dict(symbol=sym, session=sess.name, case=label,
@@ -691,14 +730,19 @@ def main(argv=None) -> None:
                    help="comma-separated risk per trade for an equity what-if, e.g. 0.005,0.01")
     p.add_argument("--target-mult", type=float, default=1.0,
                    help="target distance as a multiple of the range (default 1.0)")
+    p.add_argument("--partial", default="",
+                   help="partial exits as share:target_mult pairs, e.g. 0.5:0.5,0.5:2")
     p.add_argument("--no-stop", action="store_true",
                    help="what-if only: never trigger the stop (breaks the plan's hard rule)")
     p.add_argument("--server-tz", default=None,
                    help="override detection, e.g. NY+7, Europe/Helsinki, Etc/GMT-2")
     a = p.parse_args(argv)
     risks = tuple(float(x) for x in a.risks.split(",") if x.strip())
+    partial = tuple(tuple(float(v) for v in x.split(":")) for x in a.partial.split(",") if x.strip())
+    if partial and abs(sum(w for w, _ in partial) - 1.0) > 1e-9:
+        sys.exit("--partial shares must add up to 1")
     res = run(a.data, a.out, a.start, a.end, a.server_tz, risks, use_stop=not a.no_stop,
-              target_mult=a.target_mult)
+              target_mult=a.target_mult, partial=partial)
     pd.set_option("display.width", 250)
     print(res.round(3).to_string(index=False))
 

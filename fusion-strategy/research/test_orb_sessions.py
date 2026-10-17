@@ -297,6 +297,37 @@ class TestTradeRules(unittest.TestCase):
         self.assertEqual(local_hm(half["t_out"]), (8, 50))
         self.assertAlmostEqual(half["plan_dist"], one["plan_dist"])
 
+    def test_partial_take_profit(self):
+        df, local = london_day()
+        set_bar(df, local, 8, 40, high=1.1012)            # long entry 1.1011
+        set_bar(df, local, 9, 0, high=1.1021)             # 0.5x target 1.1020
+        set_bar(df, local, 10, 0, high=1.1051)            # 2x target 1.1050
+        legs = [sim(df, target_mult=m)[0] for m in (0.5, 2.0)]
+        (t,), dropped = orb.merge_legs(legs, (0.5, 0.5))
+        self.assertEqual((t["reason"], dropped), ("target+target", 0))
+        self.assertEqual(local_hm(t["t_out"]), (10, 0))
+        s = orb.size_and_score([t], "EURUSD").iloc[0]
+        self.assertEqual(s.units, 226_000)                 # two legs of 113,000
+        want = 113_000 * (1.1019 - 1.1011) + 113_000 * (1.1049 - 1.1011) - 7.0 * 2.26
+        self.assertAlmostEqual(s.pnl_usd, want, places=6)
+        # first leg banks, second is stopped
+        set_bar(df, local, 10, 0, high=1.1001, low=1.0985)
+        legs = [sim(df, target_mult=m)[0] for m in (0.5, 2.0)]
+        (t,), _ = orb.merge_legs(legs, (0.5, 0.5))
+        self.assertEqual(t["reason"], "target+stop")
+        s = orb.size_and_score([t], "EURUSD").iloc[0]
+        want = 113_000 * (1.1019 - 1.1011) + 113_000 * (1.0989 - 1.1011) - 7.0 * 2.26
+        self.assertAlmostEqual(s.pnl_usd, want, places=6)
+
+    def test_single_full_leg_equals_plain_target(self):
+        df = random_walk_utc(start="2024-01-01", weeks=8, seed=9)
+        days = orb.trading_days(df, LONDON)
+        plain, _ = orb.simulate_session(bars_from(df), "EURUSD", LONDON, days, target_mult=2.0)
+        merged, _ = orb.merge_legs([plain], (1.0,))
+        a = orb.size_and_score(plain, "EURUSD").R.to_numpy()
+        b = orb.size_and_score(merged, "EURUSD").R.to_numpy()
+        self.assertTrue(np.allclose(a, b))
+
     def test_without_stop_trade_rides_to_target_or_time(self):
         df, local = london_day()
         set_bar(df, local, 8, 40, high=1.1012)
