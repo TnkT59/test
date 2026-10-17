@@ -50,7 +50,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-SYMBOLS = ("XAUUSD", "EURUSD", "GBPUSD", "USDJPY")
+SYMBOLS = ("XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USTEC", "US30")
 ALIASES = {"GOLD": "XAUUSD"}
 
 SPEC = {
@@ -59,9 +59,17 @@ SPEC = {
     "GBPUSD": dict(lot=100_000, pip=0.0001, slip=0.0001, max_lev=30.0),
     "USDJPY": dict(lot=100_000, pip=0.01, slip=0.01, max_lev=30.0),
     "XAUUSD": dict(lot=100, pip=0.01, slip=0.20, max_lev=20.0),
+    # US index CFDs: contract size differs by broker and is not in the bar
+    # data. 1 unit per lot is assumed; R, profit factor, win rate and %-equity
+    # results do not depend on it. Slippage per fill is an assumption
+    # (1 point USTEC, 2 points US30), not part of the original cost rules.
+    "USTEC": dict(lot=1, pip=1.0, slip=1.0, max_lev=20.0),
+    "US30": dict(lot=1, pip=1.0, slip=2.0, max_lev=20.0),
 }
 COMMISSION_PER_LOT_RT = 7.0          # FX, USD per round-turn lot
-COMMISSION_PER_100K_NOTIONAL = 7.0   # XAU, USD per round turn per $100k
+COMMISSION_PER_100K_NOTIONAL = 7.0   # XAU and indices, USD per round turn per $100k
+NOTIONAL_COMMISSION = ("XAUUSD", "USTEC", "US30")
+INDICES = ("USTEC", "US30")
 RISK_PCT = 0.005
 START_EQUITY = 100_000.0
 NY_ROLL_HOUR = 17
@@ -87,6 +95,15 @@ SESSIONS = (
     Session("London", "Europe/London", "08:00", "08:30", "11:00", "16:00"),
     Session("NewYork", "America/New_York", "08:00", "08:30", "11:00", "16:00"),
 )
+# US index CFDs: New York ORB on the 09:30 cash open, as in the published
+# index ORB studies.
+NY_INDEX = Session("NewYork", "America/New_York", "09:30", "10:00", "12:00", "16:00")
+
+
+def sessions_for(sym: str) -> tuple[Session, ...]:
+    if sym in INDICES:
+        return SESSIONS[:2] + (NY_INDEX,)
+    return SESSIONS
 
 
 # --------------------------------------------------------------------------
@@ -135,7 +152,16 @@ def read_mt5_csv(path: pathlib.Path) -> pd.DataFrame:
     out = pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in need})
     out.index = pd.DatetimeIndex(idx, name="server_time")
     bar_minutes(out.index, path.name)
+    out.attrs["digits"] = text_digits(df["close"])
     return out
+
+
+def text_digits(col: pd.Series) -> int:
+    """Price digits as MT5 printed them (e.g. '33361.50' -> 2). MT5 writes
+    every price with the symbol's digits, and the <SPREAD> column is in units
+    of 10**-digits, so this must come from the text, not the float values."""
+    frac = col.dropna().str.strip().str.partition(".")[2]
+    return int(frac.str.len().max()) if len(frac) else 0
 
 
 def bar_minutes(idx: pd.DatetimeIndex, name: str = "") -> int:
@@ -351,7 +377,8 @@ def _first_bar(trades: pd.DataFrame, bar_min: int) -> pd.Series:
     return trades.mins_after_range < bar_min
 
 
-def size_and_score(trades: list[dict], sym: str, costs: bool = True) -> pd.DataFrame:
+def size_and_score(trades: list[dict], sym: str, costs: bool = True,
+                   risk_pct: float = RISK_PCT) -> pd.DataFrame:
     """Size each trade before its fill (on the order level and the planned
     loss), compound equity, return trades with USD P/L and R."""
     spec = SPEC[sym]
@@ -363,7 +390,7 @@ def size_and_score(trades: list[dict], sym: str, costs: bool = True) -> pd.DataF
         plan_usd = tr["plan_dist"] * to_usd
         if plan_usd <= 0:
             continue
-        units = RISK_PCT * eq / plan_usd
+        units = risk_pct * eq / plan_usd
         per_unit_notional = 1.0 if sym == "USDJPY" else ref
         capped = units * per_unit_notional > spec["max_lev"] * eq
         if capped:
@@ -375,7 +402,7 @@ def size_and_score(trades: list[dict], sym: str, costs: bool = True) -> pd.DataF
         pnl = tr["dir"] * (tr["exit"] - tr["entry"]) * units
         pnl_usd = pnl / tr["exit"] if sym == "USDJPY" else pnl
         if costs:
-            if sym == "XAUUSD":
+            if sym in NOTIONAL_COMMISSION:
                 comm = COMMISSION_PER_100K_NOTIONAL * units * tr["entry"] / 100_000
             else:
                 comm = COMMISSION_PER_LOT_RT * units / spec["lot"]
@@ -387,7 +414,8 @@ def size_and_score(trades: list[dict], sym: str, costs: bool = True) -> pd.DataF
         eq += net
         rows.append({**tr, "units": units, "lots": units / spec["lot"], "capped": capped,
                      "commission": comm, "pnl_usd": net, "risk_usd": risk_usd,
-                     "R": net / risk_usd, "equity_before": eq_before, "equity": eq})
+                     "R": net / risk_usd, "risk_pct_actual": risk_usd / eq_before,
+                     "equity_before": eq_before, "equity": eq})
     return pd.DataFrame(rows)
 
 
@@ -427,6 +455,19 @@ def metrics(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> dict:
                 n_long=len(rl), avg_R_long=float(rl.mean()) if len(rl) else float("nan"),
                 n_short=len(rs), avg_R_short=float(rs.mean()) if len(rs) else float("nan"),
                 worst_R=float(r.min()), capped=int(df.capped.sum()))
+
+
+def risk_row(scored: pd.DataFrame, n_signals: int, start, end) -> dict:
+    """Equity outcome at one risk setting. Trades that round to zero lots
+    (account too small) are not taken."""
+    if scored.empty:
+        return dict(trades_taken=0, signals=n_signals)
+    m = metrics(scored, start, end)
+    return dict(signals=n_signals, trades_taken=m["trades"], final_equity=float(scored.equity.iloc[-1]),
+                min_equity=float(min(START_EQUITY, scored.equity.min())), cagr=m["cagr"],
+                max_dd=m["max_dd"], sharpe=m["sharpe"], avg_R=m["avg_R"],
+                share_capped=float(scored.capped.mean()),
+                median_actual_risk=float(scored.risk_pct_actual.median()))
 
 
 def survives(m: dict) -> bool:
@@ -472,15 +513,20 @@ def load_raw(files) -> pd.DataFrame:
     sizes = {bar_minutes(p.index, f.name) for p, f in zip(parts, files)}
     if len(sizes) != 1:
         raise ValueError(f"mixed bar sizes {sorted(sizes)} in {[f.name for f in files]}")
+    digits = {p.attrs["digits"] for p in parts}
+    if len(digits) != 1:
+        raise ValueError(f"mixed price digits {sorted(digits)} in {[f.name for f in files]}")
     df = pd.concat(parts).sort_index(kind="stable")
-    return df[~df.index.duplicated(keep="first")]
+    df = df[~df.index.duplicated(keep="first")].copy()
+    df.attrs["digits"] = digits.pop()
+    return df
 
 
 def resolve_server_tz(raw: dict[str, pd.DataFrame], override: str | None):
     """One timezone for the whole broker, detected on the FX symbols."""
     if override:
         return override, {}
-    fx = [s for s in raw if s != "XAUUSD"]
+    fx = [s for s in raw if s in ("EURUSD", "GBPUSD", "USDJPY")]
     if not fx:
         sys.exit("no FX symbol to detect the broker timezone from; pass --server-tz")
     found = {s: detect_server_tz(raw[s].index) for s in fx}
@@ -492,11 +538,13 @@ def resolve_server_tz(raw: dict[str, pd.DataFrame], override: str | None):
 
 def load_symbol(df: pd.DataFrame, tz: str):
     """Convert to UTC, drop bad rows, add raw and conservative spreads."""
+    digits = df.attrs.get("digits")
     bad = df[["open", "high", "low", "close", "spread"]].isna().any(axis=1) \
         | (df.high < df.low) | (df.spread < 0)
     n_bad = int(bad.sum())
     df = df[~bad]
-    point = infer_point(np.concatenate([df.open.to_numpy(), df.close.to_numpy()]))
+    point = (10.0 ** -digits if digits is not None
+             else infer_point(np.concatenate([df.open.to_numpy(), df.close.to_numpy()])))
     df = df.copy()
     df.index = server_to_utc(df.index, tz)
     dropped = int(df.index.isna().sum())
@@ -525,9 +573,9 @@ def _spread_note(df: pd.DataFrame, sym: str) -> str:
     pip = SPEC[sym]["pip"]
     raw, cons = df.spread_px / pip, df.spread_cons / pip
     q = lambda s: "/".join(f"{s.quantile(x):.2f}" for x in (0.5, 0.9, 0.99))
-    parts = [f"spread in pips p50/p90/p99: raw {q(raw)}, conservative {q(cons)}; "
+    parts = [f"spread p50/p90/p99 in units of {pip:g} price: raw {q(raw)}, conservative {q(cons)}; "
              f"bars with zero spread {float((df.spread == 0).mean()):.1%}"]
-    for sess in SESSIONS:
+    for sess in sessions_for(sym):
         loc = df.index.tz_convert(sess.tz)
         hhmm = loc.strftime("%H:%M")
         w = (hhmm >= sess.range_start) & (hhmm < sess.exit)
@@ -538,6 +586,7 @@ def _spread_note(df: pd.DataFrame, sym: str) -> str:
 def _plot(trades: pd.DataFrame, path: pathlib.Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
+    import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharey=True)
@@ -547,6 +596,8 @@ def _plot(trades: pd.DataFrame, path: pathlib.Path) -> None:
             x = pd.to_datetime(g.t_out, utc=True)
             ax.plot(x, g.R.cumsum().to_numpy(), label=sym, linewidth=1.2)
         ax.axhline(0, color="grey", linewidth=0.8)
+        ax.xaxis.set_major_locator(mdates.YearLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
         ax.set_title(f"{sess.name} ORB, net of costs")
         ax.set_ylabel("cumulative R")
         ax.legend(fontsize=8)
@@ -556,7 +607,7 @@ def _plot(trades: pd.DataFrame, path: pathlib.Path) -> None:
 
 
 def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | None,
-        server_tz: str | None) -> pd.DataFrame:
+        server_tz: str | None, risks: tuple[float, ...] = ()) -> pd.DataFrame:
     out_dir.mkdir(parents=True, exist_ok=True)
     files: dict[str, list[pathlib.Path]] = {}
     for f in sorted(data_dir.glob("*.csv")):
@@ -565,7 +616,7 @@ def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | No
             files.setdefault(s, []).append(f)
     if not files:
         sys.exit(f"no MT5 CSV files for {SYMBOLS} found in {data_dir}")
-    rows, all_trades, notes = [], [], []
+    rows, all_trades, notes, sweep = [], [], [], []
     raw = {sym: load_raw(fl) for sym, fl in files.items()}
     sizes = {sym: bar_minutes(df.index, sym) for sym, df in raw.items()}
     if len(set(sizes.values())) != 1:
@@ -588,7 +639,7 @@ def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | No
         bars = to_bars(df)
         bar_min = bars.bar_ns // 60_000_000_000
         span = (df.index.min().tz_localize(None), df.index.max().tz_localize(None))
-        for sess in SESSIONS:
+        for sess in sessions_for(sym):
             days = trading_days(df, sess)
             for label, costs, stress in CASES:
                 tr, st = simulate_session(bars, sym, sess, days, costs=costs, stress=stress)
@@ -600,6 +651,11 @@ def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | No
                                                 and m.get("trades") else None)))
                 if label == "net" and not scored.empty:
                     all_trades.append(scored)
+                if label == "net":
+                    for r in risks:
+                        sweep.append(dict(symbol=sym, session=sess.name, risk_pct=r,
+                                          **risk_row(size_and_score(tr, sym, risk_pct=r),
+                                                     len(tr), *span)))
     res = pd.DataFrame(rows)
     res.to_csv(out_dir / "orb_metrics.csv", index=False)
     if all_trades:
@@ -609,6 +665,8 @@ def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | No
         pooled(trades).to_csv(out_dir / "orb_pooled_by_session.csv", index=False)
         entry_timing(trades, bar_min).to_csv(out_dir / "orb_entry_timing.csv", index=False)
         _plot(trades, out_dir / "orb_cum_R.png")
+    if sweep:
+        pd.DataFrame(sweep).to_csv(out_dir / "orb_risk_sweep.csv", index=False)
     (out_dir / "data_notes.txt").write_text("\n".join(notes) + "\n")
     return res
 
@@ -619,10 +677,13 @@ def main(argv=None) -> None:
     p.add_argument("--out", type=pathlib.Path, default=pathlib.Path("results/orb_sessions"))
     p.add_argument("--start", default="2023-01-01")
     p.add_argument("--end", default=None)
+    p.add_argument("--risks", default="",
+                   help="comma-separated risk per trade for an equity what-if, e.g. 0.005,0.01")
     p.add_argument("--server-tz", default=None,
                    help="override detection, e.g. NY+7, Europe/Helsinki, Etc/GMT-2")
     a = p.parse_args(argv)
-    res = run(a.data, a.out, a.start, a.end, a.server_tz)
+    risks = tuple(float(x) for x in a.risks.split(",") if x.strip())
+    res = run(a.data, a.out, a.start, a.end, a.server_tz, risks)
     pd.set_option("display.width", 250)
     print(res.round(3).to_string(index=False))
 

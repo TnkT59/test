@@ -203,4 +203,14 @@ Count: 8 × 4 + 1 + 4 × 2 + 1 = **42 strategy-timeframe cells × 4 symbols = 16
   - **Data:** M1 bars exported from your MT5 demo terminal, instead of Dukascopy. MT5 bars are bid-only and carry one spread value per bar, reportedly the bar's *minimum* spread, so a 2× spread stress case is reported alongside.
   - **Period: 2023-01-01 to the end of the data, as one block, on your instruction.** This overlaps the 2025+ holdout. **The holdout is no longer clean for any strategy that includes an ORB or session-breakout component (S1, S2 or this test).** Phase 5 must state this if such a component reaches the final strategy.
   - **Sessions:** these are not the same as S1/S2 in §4.5. Each session uses its own first 30 minutes as the range: Tokyo 09:00–09:30 JST, London 08:00–08:30, New York 08:00–08:30 local time. Exits are at 15:00 JST, 16:00 London and 16:00 NY.
+- **2026-10-17. ORB run on your data.**
+  - **Data:** you supplied M15 exports for XAUUSD, USDJPY, USTEC and US30. EURUSD and GBPUSD were swapped for the two US index CFDs.
+  - **Index assumptions:**
+    - Contract size: 1 unit per lot.
+    - Slippage: 1 point USTEC and 2 points US30 per fill.
+    - Commission: $7 per $100k notional.
+    - New York range: 09:30–10:00 ET.
+    - These were proposed and have not been confirmed by you.
+  - **Result:** nothing passes the survival gate. See `results/orb_sessions/README.md`.
+  - **Risk what-if:** a sweep of 0.5–15% risk per trade was run as a backtest at your request. The plan's limit stays at 0.5%.
 

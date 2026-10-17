@@ -123,6 +123,43 @@ class TestLoader(unittest.TestCase):
         self.assertFalse(out[["open", "high", "low", "close", "spread_cons"]].isna().any().any())
 
 
+class TestIndicesAndDigits(unittest.TestCase):
+    def test_digits_come_from_text_not_float(self):
+        col = pd.Series(["33361.50", "33368.50", "33264.00"])
+        self.assertEqual(orb.text_digits(col), 2)               # floats alone suggest 1
+        self.assertAlmostEqual(orb.infer_point(col.astype(float).to_numpy()), 0.1)
+        self.assertEqual(orb.text_digits(pd.Series(["130.924"])), 3)
+
+    def test_loaded_index_spread_uses_text_digits(self):
+        idx = pd.date_range("2024-01-02 01:00", periods=200, freq="15min")
+        lines = ["<DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\t<TICKVOL>\t<VOL>\t<SPREAD>"]
+        lines += [f"{t:%Y.%m.%d}\t{t:%H:%M:%S}\t33361.50\t33368.50\t33264.50\t33271.50\t1\t0\t150"
+                  for t in idx]
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "US30_M15.csv"
+            f.write_text("\n".join(lines) + "\n")
+            raw = orb.load_raw([f])
+        self.assertEqual(raw.attrs["digits"], 2)
+        out, point, _, _ = orb.load_symbol(raw, "NY+7")
+        self.assertAlmostEqual(point, 0.01)
+        self.assertAlmostEqual(out.spread_px.iloc[0], 1.50)      # 150 points = 1.5 index points
+
+    def test_symbols_and_sessions(self):
+        self.assertEqual(orb.symbol_of(pathlib.Path("USTEC_M15_2023.csv")), "USTEC")
+        self.assertEqual(orb.symbol_of(pathlib.Path("US30_M15_2023.csv")), "US30")
+        ny = orb.sessions_for("USTEC")[2]
+        self.assertEqual((ny.range_start, ny.range_end), ("09:30", "10:00"))
+        self.assertEqual(orb.sessions_for("XAUUSD")[2].range_start, "08:00")
+
+    def test_index_commission_is_per_notional(self):
+        t = dict(day=DAY, session="NewYork", symbol="US30", dir=1, t_in=0, t_out=MIN,
+                 mins_after_range=0, reason="time", level=40000.0, entry=40002.0,
+                 exit=40050.0, stop=39950.0, range=50.0, plan_dist=54.0)
+        s = orb.size_and_score([t], "US30").iloc[0]
+        self.assertAlmostEqual(s.units, 9.25)                   # floor(500 / 54, 0.01)
+        self.assertAlmostEqual(s.commission, 7.0 * 9.25 * 40002.0 / 100_000)
+
+
 class TestServerTimezone(unittest.TestCase):
     def test_detects_ny_plus_7(self):
         df = random_walk_utc(start="2023-01-01", weeks=60)
@@ -386,6 +423,16 @@ class TestSizing(unittest.TestCase):
         self.assertAlmostEqual(s.commission, 7.0 * 48 * 2000.20 / 100_000)
         self.assertAlmostEqual(s.pnl_usd, 9.8 * 48 - s.commission, places=6)
 
+    def test_risk_setting_scales_size_not_r(self):
+        t = self.trade(level=1.1010, entry=1.1011, exit=1.0989, stop=1.0990, range=0.0020,
+                       plan_dist=0.0022)
+        lo = orb.size_and_score([t, t], "EURUSD", risk_pct=0.005)
+        hi = orb.size_and_score([t, t], "EURUSD", risk_pct=0.03)
+        self.assertAlmostEqual(lo.R.iloc[0], hi.R.iloc[0], places=2)
+        self.assertGreater(hi.units.iloc[0], 5.9 * lo.units.iloc[0])
+        self.assertLess(hi.equity.iloc[-1], lo.equity.iloc[-1])
+        self.assertAlmostEqual(hi.risk_pct_actual.iloc[0], 0.03, places=3)
+
     def test_leverage_cap(self):
         t = self.trade(level=1.3000, entry=1.3001, exit=1.3000, stop=1.3000, range=0.0,
                        plan_dist=0.0002)
@@ -424,7 +471,7 @@ class TestMetrics(unittest.TestCase):
         days = pd.bdate_range("2024-01-01", periods=200).date
         r = rng.normal(0.05, 1.0, len(days))
         one = pd.DataFrame(dict(session="London", day=days, R=r))
-        four = pd.concat([one.assign(symbol=s) for s in orb.SYMBOLS])
+        four = pd.concat([one.assign(symbol=s) for s in ("XAUUSD", "USDJPY", "USTEC", "US30")])
         p = orb.pooled(four).iloc[0]
         self.assertEqual(p.trades, 800)
         self.assertAlmostEqual(p.t_stat_daily_clustered, orb._t(r))
