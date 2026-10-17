@@ -1,0 +1,4 @@
+{'symbol': 'XAUUSD', 'research': 516, 'engine': 516, 'identical': 466, 'differ': 50, 'avgR_research': np.float64(-0.13945465684464795), 'avgR_engine': np.float64(-0.13939552078539105)}
+  differences: {'direction: both range sides crossed in the entry bar': 47, 'exit: research time vs engine deadline': 3}
+{'symbol': 'USDJPY', 'research': 517, 'engine': 517, 'identical': 461, 'differ': 56, 'avgR_research': np.float64(-0.12279620543344077), 'avgR_engine': np.float64(-0.12250315266130676)}
+  differences: {'direction: both range sides crossed in the entry bar': 56}

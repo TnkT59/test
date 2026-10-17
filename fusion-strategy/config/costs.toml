@@ -1,0 +1,75 @@
+# Cost model (PLAN.md section 5, defaults approved 2026-10-14).
+#   lot          units per 1.0 lot (FX 100,000 base units; XAU 100 oz)
+#   pip          pip size, used for reporting spreads
+#   slip         slippage per fill, price units (1 pip FX, $0.20 XAU), charged on every fill
+#   max_lev      leverage cap on position notional (EU retail: 30 FX majors, 20 gold)
+#   commission   "per_lot" ($7 per round-turn lot) or "per_notional" ($7 per $100k notional)
+#   swap_long / swap_short: broker swap in points per lot per night (negative = you pay).
+#     Fill these from MT5 Symbol -> Specification. Empty (nan) means unknown: the
+#     engine refuses to hold a position over the 17:00 New York roll until set.
+#   triple_swap_day: weekday whose roll is charged three times (MT5 "3-days swap").
+
+[EURUSD]
+lot = 100000
+pip = 0.0001
+slip = 0.0001
+max_lev = 30.0
+commission = "per_lot"
+swap_long = nan
+swap_short = nan
+triple_swap_day = "Wednesday"
+
+[GBPUSD]
+lot = 100000
+pip = 0.0001
+slip = 0.0001
+max_lev = 30.0
+commission = "per_lot"
+swap_long = nan
+swap_short = nan
+triple_swap_day = "Wednesday"
+
+[USDJPY]
+lot = 100000
+pip = 0.01
+slip = 0.01
+max_lev = 30.0
+commission = "per_lot"
+swap_long = nan
+swap_short = nan
+triple_swap_day = "Wednesday"
+
+[XAUUSD]
+lot = 100
+pip = 0.01
+slip = 0.20
+max_lev = 20.0
+commission = "per_notional"
+swap_long = nan
+swap_short = nan
+triple_swap_day = "Wednesday"
+
+# US index CFDs (added 2026-10-18 for the run on the data you supplied).
+# Contract size, slippage and commission are assumptions, not your broker's
+# confirmed values: 1 unit per lot (R, profit factor and win rate do not
+# depend on it), slippage 1 point USTEC / 2 points US30 per fill, $7 per
+# $100k notional, 20:1 leverage cap.
+[USTEC]
+lot = 1
+pip = 1.0
+slip = 1.0
+max_lev = 20.0
+commission = "per_notional"
+swap_long = nan
+swap_short = nan
+triple_swap_day = "Friday"
+
+[US30]
+lot = 1
+pip = 1.0
+slip = 2.0
+max_lev = 20.0
+commission = "per_notional"
+swap_long = nan
+swap_short = nan
+triple_swap_day = "Friday"
