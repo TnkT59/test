@@ -41,9 +41,13 @@ def _turtle_last_breakout_won(df: pd.DataFrame, entry_n: int, exit_n: int,
     close of t. A hypothetical trade enters at the breakout level (or the open
     if price gapped through it), is a loser if price moves 2N against it, and
     otherwise ends at the 10-day exit; a winner if that exit is above the
-    entry (long) or below it (short). If both breakout levels are crossed in
-    the same bar, the one nearer the bar's open is taken as first."""
-    o, h, l = df.open.to_numpy(), df.high.to_numpy(), df.low.to_numpy()
+    entry (long) or below it (short).
+
+    Bar-level conventions: if both breakout levels are crossed in the same bar,
+    the one nearer the bar's open is taken as first; the 2N stop may be hit on
+    the breakout bar itself; on the bar a trade exits, a break of the opposite
+    20-bar level (which lies beyond the 10-bar exit) starts a new one."""
+    o, h, l, c = df.open.to_numpy(), df.high.to_numpy(), df.low.to_numpy(), df.close.to_numpy()
     hi = ind.donchian_high(df.high, entry_n).to_numpy()
     lo = ind.donchian_low(df.low, entry_n).to_numpy()
     xhi = ind.donchian_high(df.high, exit_n).to_numpy()
@@ -51,28 +55,42 @@ def _turtle_last_breakout_won(df: pd.DataFrame, entry_n: int, exit_n: int,
     out = np.zeros(len(df), dtype=bool)
     won = False
     pos, entry, stop = 0, 0.0, 0.0
+
+    def start(direction: int, level: float, j: int, n: float, after_exit: bool) -> None:
+        nonlocal pos, entry, stop, won
+        pos = direction
+        if after_exit:
+            # price came through the exit first, so the bar's other extreme
+            # was before this entry and cannot be its stop
+            entry = level
+        else:
+            entry = max(level, o[j]) if direction == 1 else min(level, o[j])
+        stop = entry - 2 * n if direction == 1 else entry + 2 * n
+        if after_exit:
+            # only the path from the bar's far extreme to its close is known
+            # to come after this entry
+            hit = c[j] <= stop if pos == 1 else c[j] >= stop
+        else:
+            hit = l[j] <= stop if pos == 1 else h[j] >= stop
+        if hit:
+            won, pos = False, 0
+
     for j in range(1, len(df)):
+        H, L, N = hi[j - 1], lo[j - 1], n_vals[j - 1]
+        levels_ok = np.isfinite(H) and np.isfinite(L) and np.isfinite(N)
         if pos == 0:
-            H, L, N = hi[j - 1], lo[j - 1], n_vals[j - 1]
-            if not (np.isfinite(H) and np.isfinite(L) and np.isfinite(N)):
-                out[j] = won
-                continue
-            up, dn = h[j] > H, l[j] < L
-            if up and dn:
-                up = abs(o[j] - H) <= abs(o[j] - L)
-                dn = not up
-            if up:
-                pos, entry = 1, max(H, o[j])
-                stop = entry - 2 * N
-            elif dn:
-                pos, entry = -1, min(L, o[j])
-                stop = entry + 2 * N
-            if pos != 0:
-                # the stop can be hit on the breakout bar itself
-                if (pos == 1 and l[j] <= stop) or (pos == -1 and h[j] >= stop):
-                    won, pos = False, 0
+            if levels_ok:
+                up, dn = h[j] > H, l[j] < L
+                if up and dn:
+                    up = abs(o[j] - H) <= abs(o[j] - L)
+                    dn = not up
+                if up:
+                    start(1, H, j, N, after_exit=False)
+                elif dn:
+                    start(-1, L, j, N, after_exit=False)
         else:
             X = xlo[j - 1] if pos == 1 else xhi[j - 1]
+            was = pos
             if pos == 1:
                 if l[j] <= stop:
                     won, pos = False, 0
@@ -83,6 +101,11 @@ def _turtle_last_breakout_won(df: pd.DataFrame, entry_n: int, exit_n: int,
                     won, pos = False, 0
                 elif np.isfinite(X) and h[j] >= X:
                     won, pos = max(X, o[j]) < entry, 0
+            if pos == 0 and levels_ok:
+                if was == 1 and l[j] < L:
+                    start(-1, L, j, N, after_exit=True)
+                elif was == -1 and h[j] > H:
+                    start(1, H, j, N, after_exit=True)
         out[j] = won
     return out
 

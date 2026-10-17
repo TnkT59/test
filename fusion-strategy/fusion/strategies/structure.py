@@ -31,7 +31,8 @@ def pivot_reversion(df: pd.DataFrame) -> Signals:
                    stop_short_px=f(R2), stop_long_px=f(S2),
                    target_short_px=f(P), target_long_px=f(P),
                    flat_at_close=c.day_end.to_numpy(), group=c.day_id.to_numpy(),
-                   max_entries_per_group=1, per_side=True, flat_on_group_change=True)
+                   max_entries_per_group=1, per_side=True,
+                   order_expiry=c.day_close.to_numpy(), exit_deadline=c.day_close.to_numpy())
 
 
 def prior_day_breakout(df: pd.DataFrame) -> Signals:
@@ -46,4 +47,5 @@ def prior_day_breakout(df: pd.DataFrame) -> Signals:
     return Signals(df.index, long_stop=f(H), short_stop=f(L),
                    stop_long_px=f(mid), stop_short_px=f(mid),
                    flat_at_close=c.day_end.to_numpy(), group=c.day_id.to_numpy(),
-                   max_entries_per_group=1, per_side=True, flat_on_group_change=True)
+                   max_entries_per_group=1, per_side=True,
+                   order_expiry=c.day_close.to_numpy(), exit_deadline=c.day_close.to_numpy())

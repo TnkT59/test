@@ -53,8 +53,31 @@ class TestOscillators(unittest.TestCase):
         r = ind.rsi(pd.Series(np.arange(1.0, 40.0)), 14)
         self.assertTrue((r.dropna() == 100).all())
 
+    def test_rsi_flat_is_undefined(self):
+        r = ind.rsi(pd.Series(np.full(40, 1.2345)), 14)
+        self.assertTrue(r.isna().all())
+
     def test_adx_matches_wilder_running_sums(self):
-        df = frame(400, seed=3)
+        self._adx_vs_running_sums(frame(400, seed=3))
+
+    def test_adx_equal_moves_give_no_directional_movement(self):
+        # bars whose high rises exactly as much as the low falls: Wilder
+        # counts neither +DM nor -DM
+        df = frame(400, seed=4).copy()
+        h, l = df.high.to_numpy().copy(), df.low.to_numpy().copy()
+        for t in range(30, 400, 5):
+            h[t], l[t] = h[t - 1] + 0.0004, l[t - 1] - 0.0004
+            h[t] = max(h[t], df.open.iloc[t], df.close.iloc[t])
+            l[t] = min(l[t], df.open.iloc[t], df.close.iloc[t])
+            if h[t] - h[t - 1] != l[t - 1] - l[t]:
+                d = max(h[t] - h[t - 1], l[t - 1] - l[t])
+                h[t], l[t] = h[t - 1] + d, l[t - 1] - d
+        df["high"], df["low"] = h, l
+        up, dn = np.diff(h), -np.diff(l)
+        self.assertGreater(int(((up == dn) & (up > 0)).sum()), 50)
+        self._adx_vs_running_sums(df)
+
+    def _adx_vs_running_sums(self, df):
         h, l, c = df.high.to_numpy(), df.low.to_numpy(), df.close.to_numpy()
         n = 14
         tr = np.maximum.reduce([h[1:] - l[1:], abs(h[1:] - c[:-1]), abs(l[1:] - c[:-1])])

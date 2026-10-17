@@ -97,7 +97,7 @@ Shared conventions for all strategies:
 | ID | Rules | Source |
 |---|---|---|
 | T1 MA cross | Long when SMA(50) crosses above SMA(200). Short on the cross below. Stop-and-reverse. Protective stop 2×ATR(14) (deviation). | "Golden/death cross" **(convention)**. There is no single originating paper. |
-| T2 Turtle S1 | Long on a break above the 20-bar high, short on a break below the 20-bar low (intrabar, stop-entry order). Exit on the opposite 10-bar extreme. Stop 2N, where N = Wilder ATR(20). **Skip rule:** skip a S1 signal if the previous S1 breakout trade (taken or hypothetical) was a winner. No pyramiding (the original adds up to 4 units at ½N; omitted because it is averaging *up*, not down — **ask if you want it included**). | Original Turtle Trading Rules (Faith, *Way of the Turtle*, 2007). |
+| T2 Turtle S1 | Long on a break above the 20-bar high, short on a break below the 20-bar low (intrabar, stop-entry order). Exit on the opposite 10-bar extreme. Stop 2N, where N = Wilder ATR(20). **Skip rule:** skip a S1 signal if the previous S1 breakout trade (taken or hypothetical) was a winner. When a signal is skipped, enter at the 55-bar breakout instead (the original's "Failsafe Breakout"; added in Phase 2 after checking the primary text). No pyramiding (the original adds up to 4 units at ½N; omitted because it is averaging *up*, not down — **ask if you want it included**). | Original Turtle Trading Rules (Faith, *Way of the Turtle*, 2007). |
 | T3 Turtle S2 | 55-bar breakout entry, 20-bar exit, 2N stop, no skip rule. | Same. |
 | T4 ADX trend | Long when +DI(14) crosses above −DI(14) **and** ADX(14) > 25. Short is the mirror image. Exit on the opposite DI cross. Protective stop 2×ATR(14) (deviation; Wilder used an "extreme point" rule, which I am not modelling). | Wilder, *New Concepts in Technical Trading Systems* (1978). The 25 threshold is **(convention)**. |
 
@@ -225,4 +225,8 @@ Count: 8 × 4 + 1 + 4 × 2 + 1 = **42 strategy-timeframe cells × 4 symbols = 16
   - Half the position closes at 0.5× the range and the rest runs to 2×, with the stop kept and no move to breakeven.
   - No combination passes the gate. See `results/orb_sessions_targets.md`.
   - ORB variants tried so far: 60.
+- **2026-10-17. Phase 2 corrections after review.**
+  - T2 gains the 55-day failsafe entry from the original Turtle rules, which this plan had left out.
+  - M1 closes and reopens every month.
+  - Orders and positions now carry clock deadlines, so holiday early closes (32 days for XAUUSD in 2023–26) cannot carry an order or a position into the next day.
 

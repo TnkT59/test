@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .. import indicators as ind
-from ..timeutil import NY, bar_length, closes_at_or_after, trading_day
+from ..timeutil import NY, bar_length, closes_at_or_after, trading_day, trading_day_end
 
 
 def daily_context(df: pd.DataFrame, atr_n: int = 14) -> pd.DataFrame:
@@ -34,4 +34,5 @@ def daily_context(df: pd.DataFrame, atr_n: int = 14) -> pd.DataFrame:
     # day-end bar: the one whose close reaches 17:00 New York
     ctx["day_end"] = closes_at_or_after(df.index, NY, "17:00")
     ctx["day_id"] = (day.as_unit("ns").asi8 // 86_400_000_000_000).astype(np.int64)
+    ctx["day_close"] = trading_day_end(df.index)
     return ctx

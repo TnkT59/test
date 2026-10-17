@@ -79,10 +79,14 @@ class TestTrend(unittest.TestCase):
         self.assertAlmostEqual(sig.short_stop[t], df.low.iloc[t - 54:t + 1].min())
 
     def test_turtle_losing_breakout_keeps_20_day_entry(self):
+        # the long loses on bar 61, which also breaks the 20-bar low; that
+        # short is tracked and exits as a winner on bar 72
         closes = [100.0] * 60 + [101.0] + [97.0] * 12
         df = path(closes)
         sig = turtle(df)
-        self.assertFalse(sig.notes["skip_active"].any())
+        skip = sig.notes["skip_active"]
+        self.assertFalse(skip[:72].any())
+        self.assertTrue(skip[72])
         t = 66
         self.assertAlmostEqual(sig.long_stop[t], df.high.iloc[t - 19:t + 1].max())
 
@@ -109,7 +113,7 @@ class TestMomentum(unittest.TestCase):
             self.assertTrue(len(past) > 0)
             r = df.close.iloc[i] / past.iloc[-1] - 1
             self.assertEqual(bool(sig.long_mkt[i]), r > 0)
-            self.assertEqual(bool(sig.exit_long_mkt[i]), r < 0)
+            self.assertTrue(sig.exit_long_mkt[i] and sig.exit_short_mkt[i])   # monthly reopen
         first = days[0] + pd.DateOffset(months=12)
         self.assertFalse((sig.long_mkt | sig.short_mkt)[days < first].any())
 
@@ -247,6 +251,25 @@ class TestResample(unittest.TestCase):
         h4 = resample(M15, "H4")
         ny = h4.index.tz_convert("America/New_York")
         self.assertTrue(set(ny.hour) <= {17, 21, 1, 5, 9, 13})
+
+    def test_every_source_bar_sits_inside_its_resampled_bar(self):
+        for tf in ("H1", "H4", "D1"):
+            out = resample(M15, tf)
+            lab = out.index.as_unit("ns").asi8
+            src = M15.index.as_unit("ns").asi8
+            k = np.searchsorted(lab, src, side="right") - 1
+            self.assertTrue((k >= 0).all(), tf)
+            if tf == "D1":
+                same_day = trading_day(M15.index) == trading_day(out.index[k])
+                self.assertTrue(np.asarray(same_day).all(), tf)
+            else:
+                span = {"H1": 3600, "H4": 4 * 3600}[tf] * 10**9
+                self.assertTrue((src < lab[k] + span).all(), tf)
+            grp = pd.Series(k, index=M15.index)
+            agg = M15.groupby(grp.to_numpy()).agg(open=("open", "first"), high=("high", "max"),
+                                                  low=("low", "min"), close=("close", "last"))
+            got = out.iloc[agg.index][["open", "high", "low", "close"]].to_numpy()
+            self.assertTrue(np.allclose(got, agg.to_numpy()), tf)
 
     def test_h1_aggregation(self):
         t0 = H1.index[50]

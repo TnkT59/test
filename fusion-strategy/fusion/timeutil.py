@@ -51,3 +51,19 @@ def closes_at_or_after(index: pd.DatetimeIndex, tz: str, end: str) -> np.ndarray
     start = local_minutes(index, tz)
     e = hhmm(end)
     return (start < e) & (start + blen >= e)
+
+
+def local_time_on_bar_date(index: pd.DatetimeIndex, tz: str, at: str) -> np.ndarray:
+    """UTC ns of local clock time `at` on each bar's local calendar date
+    (wall-clock, DST-aware)."""
+    midnight = index.tz_convert(tz).tz_localize(None).normalize()
+    wall = midnight + pd.Timedelta(minutes=hhmm(at))
+    return wall.tz_localize(tz, ambiguous="NaT", nonexistent="shift_forward") \
+        .tz_convert("UTC").as_unit("ns").asi8
+
+
+def trading_day_end(index: pd.DatetimeIndex) -> np.ndarray:
+    """UTC ns of 17:00 New York at the end of each bar's trading day."""
+    end = trading_day(index) + pd.Timedelta(hours=ROLL_HOUR)
+    return end.tz_localize(NY, ambiguous="NaT", nonexistent="shift_forward") \
+        .tz_convert("UTC").as_unit("ns").asi8

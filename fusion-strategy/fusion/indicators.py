@@ -65,14 +65,13 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def rsi(close: pd.Series, n: int = 14) -> pd.Series:
-    """Wilder RSI."""
+    """Wilder RSI. 100 when there were gains and no losses; undefined (NaN)
+    when price did not move at all."""
     d = close.diff()
     gain = wilder(d.clip(lower=0), n)
     loss = wilder((-d).clip(lower=0), n)
     rs = gain / loss
-    out = 100 - 100 / (1 + rs)
-    out[(loss == 0) & gain.notna()] = 100.0
-    return out
+    return 100 - 100 / (1 + rs)
 
 
 def dmi(df: pd.DataFrame, n: int = 14) -> pd.DataFrame:

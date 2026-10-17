@@ -10,18 +10,20 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from ..timeutil import bar_length, closes_at_or_after, hhmm, local_day, local_minutes
+from ..timeutil import (bar_length, closes_at_or_after, hhmm, local_day, local_minutes,
+                        local_time_on_bar_date)
 from .base import Signals, mid_frame
 
 
 def session_breakout(df: pd.DataFrame, tz: str, range_start: str, range_end: str,
                      entry_end: str, exit: str, target_mult: float = 1.0,
                      min_range_share: float = 0.8) -> Signals:
-    """Orders decided at the close of bar t are live during bar t+1 when t+1
-    opens inside [range_end, entry_end) local time. The range uses bars that
-    open inside [range_start, range_end) on the same local date; all of them
+    """Orders decided at the close of bar t are meant for bar t+1 when, with
+    no gap, t+1 would open inside [range_end, entry_end) local time; they
+    expire at entry_end, so after a gap they are not honoured. The range uses
+    bars that open inside [range_start, range_end) on the same local date; all
     have closed by then. Days with fewer than min_range_share of the expected
-    range bars get no orders."""
+    range bars get no orders. Positions must be flat by the session exit."""
     df = mid_frame(df)
     blen = int(bar_length(df.index) / pd.Timedelta(minutes=1))
     r0, r1, e1 = hhmm(range_start), hhmm(range_end), hhmm(entry_end)
@@ -46,7 +48,9 @@ def session_breakout(df: pd.DataFrame, tz: str, range_start: str, range_end: str
                    target_long_px=np.where(live, hi + target_mult * rng, np.nan),
                    target_short_px=np.where(live, lo - target_mult * rng, np.nan),
                    flat_at_close=closes_at_or_after(df.index, tz, exit),
-                   group=day, max_entries_per_group=1, flat_on_group_change=True)
+                   order_expiry=local_time_on_bar_date(df.index, tz, entry_end),
+                   exit_deadline=local_time_on_bar_date(df.index, tz, exit),
+                   group=day, max_entries_per_group=1)
 
 
 def asian_london(df: pd.DataFrame) -> Signals:

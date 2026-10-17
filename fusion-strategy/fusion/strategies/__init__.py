@@ -16,6 +16,7 @@ from .volatility import squeeze, vol_breakout
 ALL_TF = ("M15", "H1", "H4", "D1")
 INTRADAY = ("M15", "H1")
 ATR_STOP = "protective stop 2 x ATR(14) added (hard rule; the original has no stop)"
+RANGE_RULE = "no trade on a day with fewer than 80% of the range bars (data gaps)"
 
 _SPECS = (
     StrategySpec("T1", "trend", "MA cross 50/200", ALL_TF,
@@ -24,8 +25,13 @@ _SPECS = (
     StrategySpec("T2", "trend", "Turtle System 1", ALL_TF,
                  "The Original Turtle Trading Rules (Faith et al., 2003)",
                  ("no pyramiding (units at 1/2 N)",
+                  "55-day failsafe entry when a System 1 signal is skipped: in the original "
+                  "rules, missing from the PLAN.md T2 row",
                   "a losing breakout is judged by the sign of the hypothetical trade's P/L "
-                  "at its 2N stop or 10-day exit",),
+                  "at its 2N stop or 10-day exit",
+                  "the skip tracker resolves hypothetical trades on the strategy's own bars "
+                  "(stop first; nearer level first when both are crossed in one bar), so it "
+                  "can disagree with the engine's finer fills"),
                  dict(entry_n=20, exit_n=10, skip_rule=True, failsafe_n=55), turtle),
     StrategySpec("T3", "trend", "Turtle System 2", ALL_TF,
                  "The Original Turtle Trading Rules (Faith et al., 2003)",
@@ -37,7 +43,10 @@ _SPECS = (
                  dict(n=14, threshold=25.0), adx_trend),
     StrategySpec("M1", "momentum", "Time-series momentum 12m", ("D1",),
                  "Moskowitz, Ooi & Pedersen (2012), JFE",
-                 (ATR_STOP, "sized by 0.5% risk, not 40% target volatility"),
+                 (ATR_STOP, "sized by 0.5% risk, not 40% target volatility",
+                  "closed and reopened every month (one round trip a month)",
+                  "if the last weekday of a month has no bar, the decision is made on the "
+                  "first bar of the next month"),
                  dict(lookback_months=12), tsmom),
     StrategySpec("M2", "momentum", "MACD 12/26/9", ALL_TF, "Appel; default 12/26/9",
                  (ATR_STOP,), dict(fast=12, slow=26, signal=9), macd_cross),
@@ -56,9 +65,9 @@ _SPECS = (
                   "earliest entry on the day's second bar (the day's open must be known)"),
                  dict(k=0.5), vol_breakout),
     StrategySpec("S1", "session", "Asian range -> London breakout", INTRADAY, "(convention)",
-                 (), {}, asian_london),
+                 (RANGE_RULE,), {}, asian_london),
     StrategySpec("S2", "session", "New York opening range 08:00-08:30", ("M15",),
-                 "(convention)", (), {}, ny_orb),
+                 "(convention)", (RANGE_RULE,), {}, ny_orb),
     StrategySpec("P1", "structure", "Floor-pivot reversion R1/S1", INTRADAY,
                  "Floor-trader pivots; trading rule (convention)",
                  ("flat at 17:00 New York (time exit not in PLAN.md)",

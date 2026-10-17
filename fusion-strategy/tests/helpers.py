@@ -45,10 +45,22 @@ def datasets() -> dict:
     """Shared synthetic test data per timeframe (built once)."""
     if not _CACHE:
         from fusion.data.resample import resample
-        m15 = random_walk(fx_hours("2023-01-01", 160), seed=11)
+        m15 = with_early_closes(random_walk(fx_hours("2023-01-01", 160), seed=11))
         _CACHE.update({
             "M15": m15, "H1": resample(m15, "H1"), "H4": resample(m15, "H4"),
             "D1": resample(random_walk(fx_hours("2021-01-01", 1100, "1h"), seed=12, vol=0.0025,
                                        regime_len=1200, drift=0.0006), "D1"),
         })
     return _CACHE
+
+
+EARLY_CLOSE_DAYS = ("2023-02-20", "2023-04-07", "2023-05-29")   # NY dates, closes 14:00 NY
+
+
+def with_early_closes(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop bars from 14:00 to 17:00 New York on a few dates, like a holiday
+    early close, so day and session exits have no bar to fire on."""
+    ny = df.index.tz_convert("America/New_York")
+    d = pd.Series(ny.date, index=df.index).astype(str)
+    drop = d.isin(EARLY_CLOSE_DAYS).to_numpy() & (ny.hour >= 14) & (ny.hour < 17)
+    return df[~drop]

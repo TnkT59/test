@@ -59,4 +59,5 @@ def vol_breakout(df: pd.DataFrame, k: float = 0.5, atr_n: int = 14,
     return Signals(df.index, long_stop=long_lvl, short_stop=short_lvl,
                    stop_long_dist=stop, stop_short_dist=stop,
                    flat_at_close=c.day_end.to_numpy(), group=c.day_id.to_numpy(),
-                   max_entries_per_group=1, flat_on_group_change=True)
+                   max_entries_per_group=1,
+                   order_expiry=c.day_close.to_numpy(), exit_deadline=c.day_close.to_numpy())

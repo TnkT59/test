@@ -3,8 +3,9 @@
 For every strategy and every timeframe it runs on, at 50 random cut points k:
   1. Truncation: orders computed on bars [0, k) must equal the full-data
      orders on [0, k).
-  2. Perturbation: replace bars [k, n) with unrelated prices; orders on
-     [0, k) must not change.
+  2. Perturbation: replace bars [k, n) with unrelated prices, once 30%
+     above and once 30% below the last close; orders on [0, k) must not
+     change.
   3. Negative control: a deliberately leaky strategy (reads close[t+1]) must
      fail both checks, which shows the checks can catch lookahead.
 """
@@ -32,9 +33,10 @@ def frame_of(sig: Signals) -> pd.DataFrame:
     return f
 
 
-def perturbed(df: pd.DataFrame, k: int, seed: int) -> pd.DataFrame:
-    """Bars [k, n) replaced by an unrelated random walk at a different level."""
-    noise = random_walk(df.index, seed=seed + 1000, price=float(df.close.iloc[k - 1]) * 1.3)
+def perturbed(df: pd.DataFrame, k: int, seed: int, level: float) -> pd.DataFrame:
+    """Bars [k, n) replaced by an unrelated random walk starting at `level`
+    times the last close before the cut."""
+    noise = random_walk(df.index, seed=seed + 1000, price=float(df.close.iloc[k - 1]) * level)
     out = df.copy()
     cols = ["open", "high", "low", "close"]
     out.iloc[k:, [out.columns.get_loc(c) for c in cols]] = noise[cols].iloc[k:].to_numpy()
@@ -42,19 +44,25 @@ def perturbed(df: pd.DataFrame, k: int, seed: int) -> pd.DataFrame:
 
 
 def cut_points(full: pd.DataFrame, n: int, cuts: int, rng) -> np.ndarray:
-    """Half random cuts; half targeted right after bars where an order switches
-    on (truncation then ends on that bar). A leak that only affects the bar
-    where an order first goes live, such as a range that reads the next bar,
+    """Half random cuts; half targeted so that truncation ends exactly on a bar
+    where a leak would show: the bar where any single order field switches on,
+    and the first two bars of each group (day or session). A leak that only
+    affects such bars, like a range or a day's open read from the next bar,
     is invisible to random cuts most of the time."""
     lo = max(30, n // 10)
-    live = np.zeros(n, dtype=bool)
+    cand = set()
     for c in ORDER_FIELDS:
         v = full[c].to_numpy()
-        live |= np.isfinite(v) if v.dtype.kind == "f" else v.astype(bool)
-    starts = np.flatnonzero(live & ~np.concatenate([[False], live[:-1]]))
-    starts = starts[(starts >= lo) & (starts < n - 2)]
-    k = min(cuts // 2, len(starts))
-    targeted = rng.choice(starts, size=k, replace=False) + 1 if k else np.array([], dtype=int)
+        live = np.isfinite(v) if v.dtype.kind == "f" else v.astype(bool)
+        cand.update(np.flatnonzero(live & ~np.concatenate([[False], live[:-1]])).tolist())
+    g = full["group"].to_numpy()
+    if (g != g[0]).any():
+        first = np.flatnonzero(np.concatenate([[True], g[1:] != g[:-1]]))
+        cand.update(first.tolist())
+        cand.update((first + 1).tolist())
+    cand = np.array(sorted(i for i in cand if lo <= i < n - 2), dtype=int)
+    k = min(cuts // 2, len(cand))
+    targeted = rng.choice(cand, size=k, replace=False) + 1 if k else np.array([], dtype=int)
     rand = rng.integers(lo, n - 1, size=cuts - k)
     return np.concatenate([rand, targeted.astype(int)])
 
@@ -68,9 +76,10 @@ def check(fn, df: pd.DataFrame, cuts: int = CUTS, seed: int = 0):
     for k in ks:
         want = full.iloc[:k]
         got_t = frame_of(fn(df.iloc[:k])).iloc[:k]
-        got_p = frame_of(fn(perturbed(df, k, int(k)))).iloc[:k]
+        got_up = frame_of(fn(perturbed(df, k, int(k), 1.3))).iloc[:k]
+        got_dn = frame_of(fn(perturbed(df, k, int(k), 0.7))).iloc[:k]
         bad_t += not want.equals(got_t)
-        bad_p += not want.equals(got_p)
+        bad_p += not (want.equals(got_up) and want.equals(got_dn))
     return bad_t, bad_p, len(ks)
 
 

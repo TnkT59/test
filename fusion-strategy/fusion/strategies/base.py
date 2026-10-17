@@ -8,22 +8,30 @@ depend on bars after t; tests/test_no_lookahead.py checks this.
 Prices are levels in the same price series the strategy was given (mid by
 default). The Phase 3 engine turns them into bid/ask fills with costs.
 
-Engine contract (Phase 3):
+Engine contract (Phase 3). Bar t+1 means the next bar that actually exists,
+which after a gap (weekend, holiday, early close) can open much later:
+  * Expiry: orders from bar t are honoured in bar t+1 only if t+1 opens before
+    `order_expiry[t]` (UTC ns). Session and day strategies set it to the end
+    of their entry window or trading day; others leave it unlimited.
+  * Deadline: a position opened from bar t's orders must be flat by
+    `exit_deadline[t]` (UTC ns). It is closed at the close of the bar whose
+    close reaches the deadline (`flat_at_close`), or, if that bar is missing,
+    at the open of the first bar that opens at or after the deadline.
   * At the open of bar t+1, in this order: flat/exit market orders from t,
-    then market entries from t.
-  * Inside bar t+1: entry stop/limit levels from t, then for an open position
-    its protective stop, target and exit stop/limit levels. If several can be
-    touched in the same bar, the worst outcome for the trade is assumed.
-  * `flat_at_close[t]` closes any open position at the close of bar t. It is
-    driven by the clock only (session or day end), so it is known in advance.
+    then market entries from t. An exit and an opposite entry on the same
+    open is a reversal.
+  * Inside bar t+1: for an open position, its protective stop, target and exit
+    stop/limit levels are resolved first. A new entry from a stop or limit
+    level can then fill in the same bar only if its level lies beyond the exit
+    price in the direction price was travelling. If several outcomes are
+    possible in one bar, the worst one for the trade is assumed.
+  * Fills: an entry whose fill price is already beyond its own stop is
+    cancelled; one whose fill is already beyond its target gets no target.
   * At most one position per strategy and symbol. An entry signal in the
-    direction already held is ignored. An entry in the opposite direction
-    closes the position first (stop-and-reverse) when `reverse` is True and is
-    ignored otherwise.
+    direction already held is ignored; one in the opposite direction while a
+    position is still open (no exit fired) is ignored.
   * When `max_entries_per_group` is set, the engine allows at most that many
     entries per `group` id (per side when `per_side` is True).
-  * When `flat_on_group_change` is True, a position is closed at the close of
-    the last bar of its group.
 
 Hard rule (PLAN.md): every entry must carry a protective stop, either an
 absolute level (`stop_*_px`) or a distance from the fill (`stop_*_dist`).
@@ -43,6 +51,8 @@ FLOAT_FIELDS = (
     "exit_long_stop", "exit_short_stop", "exit_long_limit", "exit_short_limit",
 )
 BOOL_FIELDS = ("long_mkt", "short_mkt", "exit_long_mkt", "exit_short_mkt", "flat_at_close")
+TIME_FIELDS = ("order_expiry", "exit_deadline")
+NO_LIMIT = np.iinfo(np.int64).max
 
 
 @dataclass
@@ -70,12 +80,12 @@ class Signals:
     exit_long_limit: np.ndarray = None  # sell-limit exit level (e.g. middle band)
     exit_short_limit: np.ndarray = None
     flat_at_close: np.ndarray = None
+    order_expiry: np.ndarray = None     # UTC ns; orders from t need t+1 to open before it
+    exit_deadline: np.ndarray = None    # UTC ns; a position from t's orders is flat by then
     # engine rules
     group: np.ndarray = None
     max_entries_per_group: int | None = None
     per_side: bool = False
-    flat_on_group_change: bool = False
-    reverse: bool = False
     notes: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -87,9 +97,13 @@ class Signals:
             v = getattr(self, name)
             setattr(self, name, np.zeros(n, dtype=bool) if v is None
                     else np.nan_to_num(np.asarray(v, dtype=float)).astype(bool))
+        for name in TIME_FIELDS:
+            v = getattr(self, name)
+            setattr(self, name, np.full(n, NO_LIMIT, dtype=np.int64) if v is None
+                    else np.asarray(v, dtype=np.int64))
         if self.group is None:
             self.group = np.zeros(n, dtype=np.int64)
-        for name in FLOAT_FIELDS + BOOL_FIELDS + ("group",):
+        for name in FLOAT_FIELDS + BOOL_FIELDS + TIME_FIELDS + ("group",):
             if len(getattr(self, name)) != n:
                 raise ValueError(f"{name} has length {len(getattr(self, name))}, expected {n}")
 
@@ -112,7 +126,8 @@ class Signals:
                                  f"({int(bad.sum())} bars)")
 
     def as_frame(self) -> pd.DataFrame:
-        data = {name: getattr(self, name) for name in FLOAT_FIELDS + BOOL_FIELDS + ("group",)}
+        data = {name: getattr(self, name) for name in FLOAT_FIELDS + BOOL_FIELDS + TIME_FIELDS
+                + ("group",)}
         return pd.DataFrame(data, index=self.index)
 
 
