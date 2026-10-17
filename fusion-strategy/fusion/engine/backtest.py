@@ -17,9 +17,13 @@ Fills, against the trader on every one:
     does not allow taking profit (the entry bar);
   * inside one fine bar, adverse exits (protective stop, exit stops) beat
     favourable ones (target, exit limits); a position opened inside a fine bar
-    may be stopped in that bar but not take profit in it;
+    may be stopped in that bar (worst case) but not take profit in it;
   * when several entry levels trigger in one fine bar, the one nearest the
-    bar's open is taken as first;
+    bar's open is taken as first (a path assumption, not the worst case);
+  * after an adverse exit, only an entry stop further along the same move may
+    fill in that bar, and its stop is judged from the bar's far extreme to its
+    close (that extreme came before the entry); after a profit-taking exit, no
+    new entry in that bar;
   * an entry whose fill is beyond its own stop is cancelled; one beyond its
     target gets no target.
 
@@ -113,10 +117,11 @@ def run_backtest(sig: Signals, fine: pd.DataFrame, cost: CostSpec, *, risk_pct: 
         t_exit = ft_l[j] if at_open else (ft_l[j] + flen if at_close else ft_l[j] + 1)
         pnl = cost.to_usd(d * (px - pos["entry"]) * units, px)
         comm = cost.commission_usd(units, pos["entry"]) if with_costs else 0.0
-        # rolls strictly after entry and strictly before exit: a position
-        # closed at 17:00 is not held over that roll
+        # rolls after the entry and up to the exit: a position closed at the
+        # close of the 16:45 bar (17:00) is out before the roll; one closed at
+        # the open of the bar that starts at 17:00 was held through it
         a = np.searchsorted(rolls, pos["t_in"], side="right")
-        b = np.searchsorted(rolls, t_exit, side="left")
+        b = np.searchsorted(rolls, t_exit, side="right" if at_open else "left")
         held = roll_dow[a:b] if b > a else np.array([], dtype=int)
         nights = int(len(held) + 2 * int((held == cost.triple_swap_day).sum()))
         swap = 0.0
@@ -183,9 +188,11 @@ def run_backtest(sig: Signals, fine: pd.DataFrame, cost: CostSpec, *, risk_pct: 
             return False
         return True
 
-    def resolve_exits(j: int, t: int) -> tuple[int, float] | None:
+    def resolve_exits(j: int, t: int):
         """Exit an open position inside fine bar j. Returns (direction of the
-        move that caused an adverse exit, exit price) or None."""
+        move that caused an adverse exit, exit price), "favourable" after a
+        profit-taking exit, or None. (An intrabar entry is resolved for its
+        own bar in try_entries, so profit is never taken in that bar.)"""
         d = pos["dir"]
         ask_h, ask_l, ask_o = h[j] + sp[j], l[j] + sp[j], o[j] + sp[j]
         if d == 1:
@@ -194,24 +201,22 @@ def run_backtest(sig: Signals, fine: pd.DataFrame, cost: CostSpec, *, risk_pct: 
                 px = min(max(adv), o[j]) - slip
                 close_pos(j, px, "stop" if max(adv) == pos["stop"] else "exit_stop", False)
                 return (-1, px + slip)
-            if pos["intrabar"] and j == pos["entry_j"]:
-                return None
             fav = [x for x in (pos["target"], S["exit_long_limit"][t]) if fin(x) and h[j] >= x]
             if fav:
                 px = min(fav) - slip          # at the level, never better (see module doc)
                 close_pos(j, px, "target" if min(fav) == pos["target"] else "exit_limit", False)
+                return "favourable"
         else:
             adv = [x for x in (pos["stop"], S["exit_short_stop"][t]) if fin(x) and ask_h >= x]
             if adv:
                 px = max(min(adv), ask_o) + slip
                 close_pos(j, px, "stop" if min(adv) == pos["stop"] else "exit_stop", False)
                 return (1, px - slip)
-            if pos["intrabar"] and j == pos["entry_j"]:
-                return None
             fav = [x for x in (pos["target"], S["exit_short_limit"][t]) if fin(x) and ask_l <= x]
             if fav:
                 px = max(fav) + slip
                 close_pos(j, px, "target" if max(fav) == pos["target"] else "exit_limit", False)
+                return "favourable"
         return None
 
     def try_entries(j: int, t: int, after_exit: tuple | None):
@@ -243,16 +248,24 @@ def run_backtest(sig: Signals, fine: pd.DataFrame, cost: CostSpec, *, risk_pct: 
         if not open_pos(j, d, fill, level, S[f"stop_{sfx}_px"][t], S[f"stop_{sfx}_dist"][t],
                         S[f"target_{sfx}_px"][t], kind, t, intrabar=True):
             return
-        # same fine bar: the stop may already be hit. After an exit in this
-        # bar, the bar's far extreme came before this entry, so only the move
-        # from there to the close counts; otherwise assume the worst.
-        stop = pos["stop"]
-        if after_exit is not None:
-            hit = c[j] <= stop if d == 1 else c[j] + sp[j] >= stop
+        # same fine bar: the stop (or an exit stop) may already be hit. After
+        # an exit in this bar, price was travelling through the exit towards
+        # this entry, so the bar's far extreme came before it and only the
+        # move from there to the close counts; otherwise assume the worst.
+        # The fill is kept inside the prices the bar traded.
+        xs = S["exit_long_stop"][t] if d == 1 else S["exit_short_stop"][t]
+        levels = [x for x in (pos["stop"], xs) if fin(x)]
+        if d == 1:
+            lvl = max(levels)                 # the first adverse level price meets
+            low = c[j] if after_exit is not None else l[j]
+            if low <= lvl:
+                close_pos(j, min(lvl, h[j]) - slip, "stop" if lvl == pos["stop"] else "exit_stop", False)
         else:
-            hit = l[j] <= stop if d == 1 else h[j] + sp[j] >= stop
-        if hit:
-            close_pos(j, stop - slip if d == 1 else stop + slip, "stop", False)
+            lvl = min(levels)
+            high = c[j] + sp[j] if after_exit is not None else h[j] + sp[j]
+            if high >= lvl:
+                close_pos(j, max(lvl, l[j] + sp[j]) + slip, "stop" if lvl == pos["stop"] else "exit_stop",
+                          False)
 
     n = len(co)
     for b in range(1, n):
@@ -287,14 +300,21 @@ def run_backtest(sig: Signals, fine: pd.DataFrame, cost: CostSpec, *, risk_pct: 
         live_entries = honoured and any(fin(S[k][t]) for k in
                                         ("long_stop", "short_stop", "long_limit", "short_limit"))
         for j in range(j0, j1):
+            if ft_l[j] >= p_to:
+                break
             if pos is not None and j > j0 and ft_l[j] >= pos["deadline"]:
                 close_pos(j, o[j] - slip if pos["dir"] == 1 else o[j] + sp[j] + slip,
                           "deadline", True)
             after = None
             if pos is not None:
                 after = resolve_exits(j, t)
-            if pos is None and live_entries:
+            if pos is None and live_entries and after != "favourable":
                 try_entries(j, t, after)
+            if pos is not None and (j + 1 >= len(ft_l) or ft_l[j + 1] >= p_to):
+                # the period ends inside this strategy bar: close at the last
+                # fine bar of the period
+                close_pos(j, c[j] - slip if pos["dir"] == 1 else c[j] + sp[j] + slip,
+                          "period_end", False, at_close=True)
             if pos is not None:
                 in_pos[j] = True
                 mark = c[j] if pos["dir"] == 1 else c[j] + sp[j]
@@ -303,10 +323,9 @@ def run_backtest(sig: Signals, fine: pd.DataFrame, cost: CostSpec, *, risk_pct: 
                 equity[j] = cash
         # --- at the close of the last fine bar
         jl = j1 - 1
-        last_in_period = b + 1 >= n or not co[b + 1] < p_to
-        if pos is not None and (S["flat_at_close"][b] or last_in_period):
+        if pos is not None and S["flat_at_close"][b] and ft_l[jl] < p_to:
             px = c[jl] - slip if pos["dir"] == 1 else c[jl] + sp[jl] + slip
-            close_pos(jl, px, "flat" if S["flat_at_close"][b] else "period_end", False, at_close=True)
+            close_pos(jl, px, "flat", False, at_close=True)
             equity[jl] = cash
 
     eq = pd.Series(equity, index=fine.index[:len(equity)])
@@ -314,5 +333,6 @@ def run_backtest(sig: Signals, fine: pd.DataFrame, cost: CostSpec, *, risk_pct: 
         eq = eq[(eq.index >= period[0]) & (eq.index < period[1])]
     eq = eq.ffill().fillna(start_equity)
     tr = pd.DataFrame(trades)
-    exposure = float(in_pos[(ft >= p_from) & (ft < p_to)].mean()) if len(ft) else 0.0
+    inside = (ft >= p_from) & (ft < p_to)
+    exposure = float(in_pos[inside].mean()) if inside.any() else 0.0
     return Result(trades=tr, equity=eq, exposure=exposure, counts=counts)

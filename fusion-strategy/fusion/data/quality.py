@@ -73,13 +73,20 @@ def expected_hours(start: pd.Timestamp, end: pd.Timestamp, gold: bool) -> tuple[
     return hours[open_ & ~hol], int((open_ & hol).sum())
 
 
-def spikes(bars: pd.DataFrame, window: int = 96, mult: float = 10.0, revert: int = 5) -> int:
+def spike_mask(bars: pd.DataFrame, window: int = 96, mult: float = 10.0, revert: int = 5) -> pd.Series:
+    """Bars whose move exceeds 10x the previous day's median |move| and
+    reverses by more than half within 5 bars. Uses later bars, so it is a
+    data-cleaning label, never a trading input."""
     lr = np.log(bars.close).diff()
     med = lr.abs().rolling(window, min_periods=window // 2).median().shift(1)
     big = lr.abs() > mult * med
     fut = np.log(bars.close).shift(-revert) - np.log(bars.close)
     reverts = (np.sign(fut) == -np.sign(lr)) & (fut.abs() > 0.5 * lr.abs())
-    return int((big & reverts).sum())
+    return big & reverts
+
+
+def spikes(bars: pd.DataFrame) -> int:
+    return int(spike_mask(bars).sum())
 
 
 DAILY_BREAK = ("XAUUSD", "USTEC", "US30")     # closed 17:00-18:00 New York

@@ -11,6 +11,14 @@ Stops (exit code 2) before any backtest when:
     overnight holds is marked "provisional", and its verdict is not final.
 --split plan (2015-2021 / 2022-2024) or available (2023 / 2024).
 Data from 2025 on is dropped at load (holdout).
+
+Spread floor (default): MT5 stores each bar's minimum spread, which is zero on
+most USDJPY bars. A market is never free to cross, so the ask estimate is
+floored at the median non-zero bar spread of the in-sample window (no
+out-of-sample information). --spread-floor none turns it off (sensitivity).
+Spike bars flagged in Phase 1 are kept by default: these are the broker's own
+prices, which the account would have traded and been stopped on, and the
+flag uses later bars. --drop-spikes removes them (sensitivity).
 """
 from __future__ import annotations
 
@@ -72,10 +80,41 @@ def pooled(rows: pd.DataFrame, trades: dict) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def prepare_bars(b: pd.DataFrame, in_sample, spread_floor: str, drop_spikes: bool):
+    """Spread floor from the in-sample window's median non-zero bar spread
+    (applied when spread_floor == "is_median"), and optional removal of
+    flagged spike bars. Returns (bars, floor in price units)."""
+    b = b.copy()
+    ins = b.spread_px[(b.index >= in_sample[0]) & (b.index < in_sample[1])]
+    floor = float(ins[ins > 0].median()) if (ins > 0).any() else 0.0
+    if spread_floor == "is_median":
+        b["spread_cons"] = np.maximum(b.spread_cons, floor)
+    if drop_spikes:
+        b = b[~quality.spike_mask(b).to_numpy()]
+    return b, floor
+
+
+def duplicates(rows: pd.DataFrame, trades: dict) -> list:
+    """Cells of the same strategy and symbol whose out-of-sample trades are
+    identical to an earlier timeframe's (e.g. a daily-level rule run on M15
+    and H1 bars): they are one test, not two."""
+    out = []
+    key = lambda t: tuple(map(tuple, t[["t_in", "t_out", "dir", "entry", "exit"]].round(10).to_numpy())) \
+        if len(t) else ()
+    seen: dict = {}
+    for _, r in rows.iterrows():
+        k = (r.strategy, r.symbol, key(trades[(r.strategy, r.tf, r.symbol, "OOS")]))
+        first = seen.setdefault(k, r.tf)
+        out.append("" if first == r.tf or not k[2] else f"{r.strategy} {first}")
+    return out
+
+
 def verdict(r) -> str:
     if r.survives:
-        return "**yes (provisional: no swap)**" if r.provisional else "**yes**"
-    return "no (provisional: no swap)" if r.provisional else "no"
+        v = "**yes (provisional: no swap)**" if r.provisional else "**yes**"
+    else:
+        v = "no (provisional: no swap)" if r.provisional else "no"
+    return v + (f"; same trades as {r.duplicate_of}" if getattr(r, "duplicate_of", "") else "")
 
 
 def survivor_table(rows: pd.DataFrame) -> str:
@@ -105,6 +144,8 @@ def main(argv=None) -> None:
     ap.add_argument("--server-tz", default=None)
     ap.add_argument("--split", choices=("plan", "available"), default="plan")
     ap.add_argument("--swap-missing", choices=("stop", "exclude"), default="stop")
+    ap.add_argument("--spread-floor", choices=("is_median", "none"), default="is_median")
+    ap.add_argument("--drop-spikes", action="store_true")
     a = ap.parse_args(argv)
     symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
     sids = [s.strip() for s in a.strategies.split(",") if s.strip()] or list(STRATEGIES)
@@ -130,6 +171,17 @@ def main(argv=None) -> None:
         stop(f"swap not set in {a.costs} for {unknown}: copy swap long/short (points) and the "
              "3-day swap weekday from MT5 Symbol -> Specification")
 
+    # ---- cost and data settings for this run
+    floors = {}
+    for s in symbols:
+        bars[s], floors[s] = prepare_bars(bars[s], IN_SAMPLE, a.spread_floor, a.drop_spikes)
+    settings = dict(split=a.split, in_sample=[str(x) for x in IN_SAMPLE],
+                    out_of_sample=[str(x) for x in OUT_OF_SAMPLE], spread_floor=a.spread_floor,
+                    floors_in_pips={s: floors[s] / costs[s].pip for s in symbols},
+                    drop_spikes=a.drop_spikes, swap_missing=a.swap_missing,
+                    swap_unknown=unknown, server_tz=tz)
+    (a.out / "settings.json").write_text(json.dumps(settings, indent=1))
+
     # ---- Phase 3 grid
     mids = {s: mt5.mid_bars(b) for s, b in bars.items()}
     rows, trades, t0 = [], {}, time.time()
@@ -137,7 +189,7 @@ def main(argv=None) -> None:
         spec = STRATEGIES[sid]
         for tf in spec.timeframes:
             for sym in symbols:
-                coarse = mids[sym] if tf == "M15" else resample(mids[sym], tf)
+                coarse = resample(mids[sym], tf)      # M15 too: whatever the export's bar size
                 sig = spec.run(coarse)
                 for name, per in (("IS", IN_SAMPLE), ("OOS", OUT_OF_SAMPLE)):
                     no_swap = sym in unknown
@@ -156,18 +208,19 @@ def main(argv=None) -> None:
                         strategy=sid, tf=tf, symbol=sym, period=name)
                 print(f"{sid} {tf} {sym} done ({time.time() - t0:.0f}s)", flush=True)
     df = pd.DataFrame(rows)
+    df["duplicate_of"] = duplicates(df, trades)
     df.to_csv(a.out / "phase3_metrics.csv", index=False)
     pd.concat([t for t in trades.values() if len(t)], ignore_index=True) \
         .to_csv(a.out / "phase3_trades.csv.gz", index=False)
     pooled(df, trades).to_csv(a.out / "phase3_pooled.csv", index=False)
     table = survivor_table(df)
     (a.out / "survivors.md").write_text(table + "\n")
-    oos = df[df.period == "OOS"]
+    oos = df[(df.period == "OOS") & (df.duplicate_of == "")]
     n_surv = int(oos.survives.sum())
     n_prov = int((oos.survives & oos.provisional).sum())
     cells = len(oos)
     print(table)
-    print(f"\n✅ Phase 3 — {cells} strategy x timeframe x symbol cells run in-sample "
+    print(f"\n✅ Phase 3 — {cells} distinct strategy x timeframe x symbol cells run in-sample "
           f"({IN_SAMPLE[0].date()}..{IN_SAMPLE[1].date()}) and out-of-sample "
           f"({OUT_OF_SAMPLE[0].date()}..{OUT_OF_SAMPLE[1].date()}) — {n_surv} survive "
           f"(OOS PF > 1.15, >= 100 trades, max DD < 25%), {n_prov} of them provisional "
