@@ -277,6 +277,20 @@ class TestTradeRules(unittest.TestCase):
         trades, _ = sim(df)
         self.assertEqual(trades, [])
 
+    def test_without_stop_trade_rides_to_target_or_time(self):
+        df, local = london_day()
+        set_bar(df, local, 8, 40, high=1.1012)
+        set_bar(df, local, 9, 0, low=1.0950)              # far through the stop
+        set_bar(df, local, 10, 0, high=1.1031)            # later reaches the target
+        (with_stop,), _ = sim(df)
+        (no_stop,), _ = sim(df, use_stop=False)
+        self.assertEqual(with_stop["reason"], "stop")
+        self.assertEqual((no_stop["reason"], local_hm(no_stop["t_out"])), ("target", (10, 0)))
+        self.assertAlmostEqual(no_stop["plan_dist"], with_stop["plan_dist"])
+        set_bar(df, local, 10, 0, high=1.1001)            # never reaches the target
+        (no_stop,), _ = sim(df, use_stop=False)
+        self.assertEqual(no_stop["reason"], "time")
+
     def test_stop_wins_when_stop_and_target_share_a_later_bar(self):
         df, local = london_day()
         set_bar(df, local, 8, 40, high=1.1012)

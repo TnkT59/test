@@ -213,4 +213,8 @@ Count: 8 × 4 + 1 + 4 × 2 + 1 = **42 strategy-timeframe cells × 4 symbols = 16
     - These were proposed and have not been confirmed by you.
   - **Result:** nothing passes the survival gate. See `results/orb_sessions/README.md`.
   - **Risk what-if:** a sweep of 0.5–15% risk per trade was run as a backtest at your request. The plan's limit stays at 0.5%.
+- **2026-10-17. No-stop what-if, at your request.**
+  - It breaks hard rule "no position without a stop loss", so it is a backtest only. It is excluded from Phases 2–7 unless you change the rule.
+  - The same ORB trades were run with the stop never triggered. All 12 combinations still fail the gate. See `results/orb_sessions_no_stop/README.md`.
+  - Trial count for the deflated Sharpe is now 24 ORB variants on top of the Phase 3 grid.
 

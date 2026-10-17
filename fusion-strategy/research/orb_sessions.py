@@ -277,11 +277,15 @@ def _ny_roll_between(t0: int, t1: int) -> bool:
 
 
 def simulate_session(bars: Bars, sym: str, sess: Session, days,
-                     costs: bool = True, stress: bool = False):
+                     costs: bool = True, stress: bool = False, use_stop: bool = True):
     """Return (trades, stats). Trades are dicts in chronological order; sizing
     is applied later. stats counts days skipped for missing range bars, and
     positions still open when the data ends before the session exit (those
-    are dropped, not closed at a wrong time)."""
+    are dropped, not closed at a wrong time).
+
+    use_stop=False is a what-if only (it breaks the plan's hard rule): the
+    stop is never triggered and trades exit at the target or session exit.
+    Position size is unchanged, so R is still measured on the stop distance."""
     spec = SPEC[sym]
     slip = spec["slip"] if costs else 0.0
     extra = spec["slip"] if stress else 0.0
@@ -329,7 +333,7 @@ def simulate_session(bars: Bars, sym: str, sess: Session, days,
                 entry_i = j
             # position open: stop first, target not on the entry bar
             if pos == 1:
-                if l <= stop:
+                if use_stop and l <= stop:
                     trades.append(_trade(day, sess, sym, pos, hi, entry, min(stop, o) - slip,
                                          stop, rng, slip, entry_i, j, r1, bars, "stop"))
                     pos = 0
@@ -340,7 +344,7 @@ def simulate_session(bars: Bars, sym: str, sess: Session, days,
                     pos = 0
                     break
             else:
-                if h + sp >= stop:
+                if use_stop and h + sp >= stop:
                     trades.append(_trade(day, sess, sym, pos, lo, entry,
                                          max(stop, o + sp) + slip, stop, rng, slip,
                                          entry_i, j, r1, bars, "stop"))
@@ -583,7 +587,7 @@ def _spread_note(df: pd.DataFrame, sym: str) -> str:
     return "; ".join(parts)
 
 
-def _plot(trades: pd.DataFrame, path: pathlib.Path) -> None:
+def _plot(trades: pd.DataFrame, path: pathlib.Path, label: str = "") -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.dates as mdates
@@ -598,7 +602,7 @@ def _plot(trades: pd.DataFrame, path: pathlib.Path) -> None:
         ax.axhline(0, color="grey", linewidth=0.8)
         ax.xaxis.set_major_locator(mdates.YearLocator())
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-        ax.set_title(f"{sess.name} ORB, net of costs")
+        ax.set_title(f"{sess.name} ORB{label}, net of costs")
         ax.set_ylabel("cumulative R")
         ax.legend(fontsize=8)
     fig.tight_layout()
@@ -607,7 +611,8 @@ def _plot(trades: pd.DataFrame, path: pathlib.Path) -> None:
 
 
 def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | None,
-        server_tz: str | None, risks: tuple[float, ...] = ()) -> pd.DataFrame:
+        server_tz: str | None, risks: tuple[float, ...] = (),
+        use_stop: bool = True) -> pd.DataFrame:
     out_dir.mkdir(parents=True, exist_ok=True)
     files: dict[str, list[pathlib.Path]] = {}
     for f in sorted(data_dir.glob("*.csv")):
@@ -642,7 +647,8 @@ def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | No
         for sess in sessions_for(sym):
             days = trading_days(df, sess)
             for label, costs, stress in CASES:
-                tr, st = simulate_session(bars, sym, sess, days, costs=costs, stress=stress)
+                tr, st = simulate_session(bars, sym, sess, days, costs=costs, stress=stress,
+                                          use_stop=use_stop)
                 scored = size_and_score(tr, sym, costs=costs)
                 m = metrics(scored, *span)
                 rows.append(dict(symbol=sym, session=sess.name, case=label,
@@ -664,7 +670,7 @@ def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | No
         _yearly(trades).to_csv(out_dir / "orb_by_year.csv", index=False)
         pooled(trades).to_csv(out_dir / "orb_pooled_by_session.csv", index=False)
         entry_timing(trades, bar_min).to_csv(out_dir / "orb_entry_timing.csv", index=False)
-        _plot(trades, out_dir / "orb_cum_R.png")
+        _plot(trades, out_dir / "orb_cum_R.png", "" if use_stop else " without stop")
     if sweep:
         pd.DataFrame(sweep).to_csv(out_dir / "orb_risk_sweep.csv", index=False)
     (out_dir / "data_notes.txt").write_text("\n".join(notes) + "\n")
@@ -679,11 +685,13 @@ def main(argv=None) -> None:
     p.add_argument("--end", default=None)
     p.add_argument("--risks", default="",
                    help="comma-separated risk per trade for an equity what-if, e.g. 0.005,0.01")
+    p.add_argument("--no-stop", action="store_true",
+                   help="what-if only: never trigger the stop (breaks the plan's hard rule)")
     p.add_argument("--server-tz", default=None,
                    help="override detection, e.g. NY+7, Europe/Helsinki, Etc/GMT-2")
     a = p.parse_args(argv)
     risks = tuple(float(x) for x in a.risks.split(",") if x.strip())
-    res = run(a.data, a.out, a.start, a.end, a.server_tz, risks)
+    res = run(a.data, a.out, a.start, a.end, a.server_tz, risks, use_stop=not a.no_stop)
     pd.set_option("display.width", 250)
     print(res.round(3).to_string(index=False))
 
