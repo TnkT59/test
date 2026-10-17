@@ -1,0 +1,27 @@
+{
+ "split": "available",
+ "in_sample": [
+  "2023-01-01 00:00:00+00:00",
+  "2024-01-01 00:00:00+00:00"
+ ],
+ "out_of_sample": [
+  "2024-01-01 00:00:00+00:00",
+  "2025-01-01 00:00:00+00:00"
+ ],
+ "spread_floor": "is_median",
+ "floors_in_pips": {
+  "XAUUSD": 5.0,
+  "USDJPY": 0.9000000000000001,
+  "USTEC": 2.0,
+  "US30": 1.0
+ },
+ "drop_spikes": false,
+ "swap_missing": "exclude",
+ "swap_unknown": [
+  "XAUUSD",
+  "USDJPY",
+  "USTEC",
+  "US30"
+ ],
+ "server_tz": "NY+7"
+}
