@@ -1,7 +1,9 @@
 """Opening-range breakout (ORB) on the Tokyo, London and New York sessions.
 
 Exploratory test requested 2026-10-17, outside the Phase 1-7 pipeline.
-Data: M1 bars exported from a MetaTrader 5 terminal (Symbols -> Bars -> Export).
+Data: M1, M5 or M15 bars exported from a MetaTrader 5 terminal
+(Symbols -> Bars -> Export). Coarser bars hide the order of events inside a
+bar; the stop-first rule below then makes results more pessimistic.
 Period: 2023-01-01 .. end of data, as one block (this uses the 2025+ holdout;
 see PLAN.md).
 
@@ -11,22 +13,30 @@ Rules (fixed, nothing tuned):
              range low (fills when bid reaches it). First trigger wins; one
              trade per session per day; entries only inside the entry window.
   * Stop   = opposite side of the range.  Target = 1 x range from the level.
+             If the entry fill is already past the target, no target is set
+             (MT5 would reject it); the trade exits by stop or time.
   * Exit   = session exit time if neither stop nor target was hit.
 
 Fill model (conservative):
-  * Buy at ask = bid + bar spread, sell at bid. Slippage against us on every
-    fill: 1 pip FX, $0.20 XAU.
-  * Stop and target touched in the same M1 bar -> stop first. On the entry bar
+  * Buy at ask, sell at bid. MT5 bars are bid bars with one spread value per
+    bar, reportedly the bar's minimum spread, so the ask is estimated as
+    bid + a conservative spread: max(bar spread, the 90th percentile of the
+    spread at the same New York minute of day over the previous 20 days).
+    That percentile uses past bars only.
+  * Slippage against us on every fill: 1 pip FX, $0.20 XAU.
+  * Stop and target touched in the same bar -> stop first. On the entry bar
     the stop can be hit but the target cannot.
   * Commission: $7 per round-turn lot FX; XAU $7 per $100k notional.
   * Swap: none, because every trade closes before the 17:00 New York roll
     (asserted in code).
-  * Sizing: 0.5% of equity at risk on the entry-to-stop distance, rounded
-    down to 0.01 lot, capped at 30:1 leverage FX / 20:1 XAU (EU retail limits).
+  * Sizing is decided before the order fills: 0.5% of equity at risk on the
+    planned loss (range + entry slippage + stop slippage), rounded down to
+    0.01 lot, capped at 30:1 leverage FX / 20:1 XAU (EU retail limits).
+    A fill that gaps past the level therefore loses more than 1R.
 
-Known limitation: MT5 stores one spread value per bar, reportedly the minimum
-spread in that bar, so the base case may understate costs. The report adds a
-"2x spread" stress case for that reason.
+Cost cases reported: "net" (the model above), "net_stress" (one extra
+slippage-sized amount added to the spread on every ask-side touch) and
+"gross" (no spread, slippage or commission).
 """
 from __future__ import annotations
 
@@ -55,6 +65,11 @@ COMMISSION_PER_100K_NOTIONAL = 7.0   # XAU, USD per round turn per $100k
 RISK_PCT = 0.005
 START_EQUITY = 100_000.0
 NY_ROLL_HOUR = 17
+SPREAD_LOOKBACK_DAYS = 20
+SPREAD_QUANTILE = 0.9
+MIN_RANGE_SHARE = 0.8                # of the range window's bars must exist
+BAR_MINUTES_ALLOWED = (1, 5, 15)
+CASES = (("net", True, False), ("net_stress", True, True), ("gross", False, False))
 
 
 @dataclass(frozen=True)
@@ -117,9 +132,19 @@ def read_mt5_csv(path: pathlib.Path) -> pd.DataFrame:
     missing = [c for c in need if c not in df.columns]
     if missing:
         raise ValueError(f"{path.name}: missing columns {missing}; got {list(df.columns)}")
-    out = pd.DataFrame({c: pd.to_numeric(df[c]) for c in need})
+    out = pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in need})
     out.index = pd.DatetimeIndex(idx, name="server_time")
+    bar_minutes(out.index, path.name)
     return out
+
+
+def bar_minutes(idx: pd.DatetimeIndex, name: str = "") -> int:
+    spacing = idx.to_series().diff().dropna()
+    m = spacing.median() / pd.Timedelta(minutes=1) if len(spacing) else float("nan")
+    if m not in BAR_MINUTES_ALLOWED:
+        raise ValueError(f"{name}: median bar spacing is {spacing.median()}, "
+                         f"expected one of M{BAR_MINUTES_ALLOWED}")
+    return int(m)
 
 
 def symbol_of(path: pathlib.Path) -> str | None:
@@ -145,6 +170,7 @@ def infer_point(prices: np.ndarray) -> float:
 
 CANDIDATE_TZ = ("NY+7", "Europe/Helsinki", "Europe/London",
                 "Europe/Berlin", "UTC", "Etc/GMT-1", "Etc/GMT-2", "Etc/GMT-3")
+FX_OPEN_NY_HOUR = 17   # spot FX reopens Sunday 17:00 New York
 
 
 def server_to_utc(idx: pd.DatetimeIndex, server_tz: str) -> pd.DatetimeIndex:
@@ -160,9 +186,6 @@ def server_to_utc(idx: pd.DatetimeIndex, server_tz: str) -> pd.DatetimeIndex:
 def weekly_opens(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
     gaps = idx[1:] - idx[:-1]
     return idx[1:][gaps > pd.Timedelta(hours=24)]
-
-
-FX_OPEN_NY_HOUR = 17   # spot FX reopens Sunday 17:00 New York
 
 
 def detect_server_tz(idx: pd.DatetimeIndex) -> tuple[str, float]:
@@ -184,6 +207,21 @@ def detect_server_tz(idx: pd.DatetimeIndex) -> tuple[str, float]:
 
 
 # --------------------------------------------------------------------------
+# Spread
+# --------------------------------------------------------------------------
+
+def conservative_spread(spread_px: pd.Series) -> pd.Series:
+    """max(bar spread, 90th percentile of the spread at the same New York
+    minute of day over the previous 20 observations). Past bars only."""
+    ny = spread_px.index.tz_convert("America/New_York")
+    key = ny.hour * 60 + ny.minute
+    hist = (spread_px.groupby(key)
+            .transform(lambda s: s.rolling(SPREAD_LOOKBACK_DAYS, min_periods=5)
+                       .quantile(SPREAD_QUANTILE).shift(1)))
+    return np.maximum(spread_px, hist.fillna(spread_px))
+
+
+# --------------------------------------------------------------------------
 # Simulation
 # --------------------------------------------------------------------------
 
@@ -194,12 +232,13 @@ class Bars:
     h: np.ndarray
     l: np.ndarray
     c: np.ndarray
-    sp: np.ndarray      # spread in price units
+    sp: np.ndarray      # ask - bid estimate, price units
+    bar_ns: int = 60_000_000_000
 
 
 def _local_bound(day, hhmm: str, tz: str) -> int:
     ts = pd.Timestamp(f"{day} {hhmm}").tz_localize(tz).tz_convert("UTC")
-    return ts.value
+    return ts.as_unit("ns").value
 
 
 def _ny_roll_between(t0: int, t1: int) -> bool:
@@ -212,22 +251,25 @@ def _ny_roll_between(t0: int, t1: int) -> bool:
 
 
 def simulate_session(bars: Bars, sym: str, sess: Session, days,
-                     spread_mult: float = 1.0, costs: bool = True):
-    """Return (trades, skipped_days). Trades are dicts in chronological order;
-    sizing is applied later. A day is skipped when < 24 of the 30 range
-    minutes have bars."""
+                     costs: bool = True, stress: bool = False):
+    """Return (trades, stats). Trades are dicts in chronological order; sizing
+    is applied later. stats counts days skipped for missing range bars, and
+    positions still open when the data ends before the session exit (those
+    are dropped, not closed at a wrong time)."""
     spec = SPEC[sym]
     slip = spec["slip"] if costs else 0.0
+    extra = spec["slip"] if stress else 0.0
     trades = []
-    skipped = 0
+    stats = dict(skipped_missing=0, incomplete=0)
+    data_end = (bars.t[-1] + bars.bar_ns) if len(bars.t) else -1
     for day in days:
         r0 = _local_bound(day, sess.range_start, sess.tz)
         r1 = _local_bound(day, sess.range_end, sess.tz)
         e1 = _local_bound(day, sess.entry_end, sess.tz)
         x1 = _local_bound(day, sess.exit, sess.tz)
         i0, i1 = np.searchsorted(bars.t, [r0, r1])
-        if i1 - i0 < 24:          # need >= 80% of the 30 range minutes
-            skipped += 1
+        if i1 - i0 < math.ceil(MIN_RANGE_SHARE * (r1 - r0) / bars.bar_ns):
+            stats["skipped_missing"] += 1
             continue
         hi = bars.h[i0:i1].max()
         lo = bars.l[i0:i1].min()
@@ -239,7 +281,7 @@ def simulate_session(bars: Bars, sym: str, sess: Session, days,
         entry = stop = target = 0.0
         entry_i = -1
         for j in range(i1, j_exit):
-            sp = bars.sp[j] * spread_mult if costs else 0.0
+            sp = bars.sp[j] + extra if costs else 0.0
             o, h, l, c = bars.o[j], bars.h[j], bars.l[j], bars.c[j]
             if pos == 0:
                 if j >= j_end_entry:
@@ -249,70 +291,85 @@ def simulate_session(bars: Bars, sym: str, sess: Session, days,
                 if long_hit:          # both in one bar -> long first, then stop check
                     pos, entry = 1, max(hi, o + sp) + slip
                     stop, target = lo, hi + rng
+                    if entry >= target:
+                        target = math.inf
                 elif short_hit:
                     pos, entry = -1, min(lo, o) - slip
                     stop, target = hi, lo - rng
+                    if entry <= target:
+                        target = -math.inf
                 else:
                     continue
                 entry_i = j
             # position open: stop first, target not on the entry bar
             if pos == 1:
                 if l <= stop:
-                    trades.append(_trade(day, sess, sym, pos, entry, min(stop, o) - slip,
-                                         stop, entry_i, j, bars, "stop", hi, lo))
+                    trades.append(_trade(day, sess, sym, pos, hi, entry, min(stop, o) - slip,
+                                         stop, rng, slip, entry_i, j, r1, bars, "stop"))
                     pos = 0
                     break
                 if j > entry_i and h >= target:
-                    trades.append(_trade(day, sess, sym, pos, entry, target - slip,
-                                         stop, entry_i, j, bars, "target", hi, lo))
+                    trades.append(_trade(day, sess, sym, pos, hi, entry, target - slip,
+                                         stop, rng, slip, entry_i, j, r1, bars, "target"))
                     pos = 0
                     break
             else:
                 if h + sp >= stop:
-                    trades.append(_trade(day, sess, sym, pos, entry, max(stop, o + sp) + slip,
-                                         stop, entry_i, j, bars, "stop", hi, lo))
+                    trades.append(_trade(day, sess, sym, pos, lo, entry,
+                                         max(stop, o + sp) + slip, stop, rng, slip,
+                                         entry_i, j, r1, bars, "stop"))
                     pos = 0
                     break
                 if j > entry_i and l + sp <= target:
-                    trades.append(_trade(day, sess, sym, pos, entry, target + slip,
-                                         stop, entry_i, j, bars, "target", hi, lo))
+                    trades.append(_trade(day, sess, sym, pos, lo, entry, target + slip,
+                                         stop, rng, slip, entry_i, j, r1, bars, "target"))
                     pos = 0
                     break
-        if pos != 0:               # time exit at the close of the last bar before exit time
+        if pos != 0 and data_end < x1:   # data ends before the session exit
+            stats["incomplete"] += 1
+        elif pos != 0:             # time exit at the close of the last bar before exit time
             k = j_exit - 1
-            sp = bars.sp[k] * spread_mult if costs else 0.0
+            sp = bars.sp[k] + extra if costs else 0.0
             px = bars.c[k] - slip if pos == 1 else bars.c[k] + sp + slip
-            trades.append(_trade(day, sess, sym, pos, entry, px, stop, entry_i, k,
-                                 bars, "time", hi, lo))
-    return trades, skipped
+            level = hi if pos == 1 else lo
+            trades.append(_trade(day, sess, sym, pos, level, entry, px, stop, rng, slip,
+                                 entry_i, k, r1, bars, "time"))
+    return trades, stats
 
 
-def _trade(day, sess, sym, pos, entry, exit_px, stop, i_in, i_out, bars, why, hi, lo):
+def _trade(day, sess, sym, pos, level, entry, exit_px, stop, rng, slip, i_in, i_out, r1,
+           bars, why):
     t_in, t_out = int(bars.t[i_in]), int(bars.t[i_out])
     assert not _ny_roll_between(t_in, t_out), "trade crosses the NY roll: swap would apply"
-    return dict(day=day, session=sess.name, symbol=sym, dir=pos, entry=entry,
-                exit=exit_px, stop=stop, t_in=t_in, t_out=t_out, reason=why,
-                range_hi=hi, range_lo=lo)
+    return dict(day=day, session=sess.name, symbol=sym, dir=pos, level=level,
+                entry=entry, exit=exit_px, stop=stop, range=rng,
+                plan_dist=rng + 2 * slip, t_in=t_in, t_out=t_out,
+                mins_after_range=(t_in - r1) // 60_000_000_000, reason=why)
+
+
+def _first_bar(trades: pd.DataFrame, bar_min: int) -> pd.Series:
+    return trades.mins_after_range < bar_min
 
 
 def size_and_score(trades: list[dict], sym: str, costs: bool = True) -> pd.DataFrame:
-    """Apply 0.5% risk sizing with compounding; return trades with USD P/L and R."""
+    """Size each trade before its fill (on the order level and the planned
+    loss), compound equity, return trades with USD P/L and R."""
     spec = SPEC[sym]
     eq = START_EQUITY
     rows = []
     for tr in trades:
-        dist = abs(tr["entry"] - tr["stop"])
-        to_usd = (1.0 / tr["entry"]) if sym == "USDJPY" else 1.0
-        dist_usd = dist * to_usd
-        if dist_usd <= 0:
+        ref = tr["level"]
+        to_usd = (1.0 / ref) if sym == "USDJPY" else 1.0
+        plan_usd = tr["plan_dist"] * to_usd
+        if plan_usd <= 0:
             continue
-        units = RISK_PCT * eq / dist_usd
-        notional_usd = units if sym == "USDJPY" else units * tr["entry"]
-        capped = notional_usd > spec["max_lev"] * eq
+        units = RISK_PCT * eq / plan_usd
+        per_unit_notional = 1.0 if sym == "USDJPY" else ref
+        capped = units * per_unit_notional > spec["max_lev"] * eq
         if capped:
-            units = spec["max_lev"] * eq / (1.0 if sym == "USDJPY" else tr["entry"])
+            units = spec["max_lev"] * eq / per_unit_notional
         step = spec["lot"] * 0.01
-        units = math.floor(units / step) * step
+        units = math.floor(units / step + 1e-9) * step
         if units <= 0:
             continue
         pnl = tr["dir"] * (tr["exit"] - tr["entry"]) * units
@@ -325,7 +382,7 @@ def size_and_score(trades: list[dict], sym: str, costs: bool = True) -> pd.DataF
         else:
             comm = 0.0
         net = pnl_usd - comm
-        risk_usd = units * dist_usd
+        risk_usd = units * plan_usd
         eq_before = eq
         eq += net
         rows.append({**tr, "units": units, "lots": units / spec["lot"], "capped": capped,
@@ -337,6 +394,10 @@ def size_and_score(trades: list[dict], sym: str, costs: bool = True) -> pd.DataF
 # --------------------------------------------------------------------------
 # Metrics
 # --------------------------------------------------------------------------
+
+def _t(r: np.ndarray) -> float:
+    return float(r.mean() / (r.std(ddof=1) / np.sqrt(len(r)))) if len(r) > 1 and r.std() > 0 else 0.0
+
 
 def metrics(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> dict:
     if df.empty:
@@ -358,16 +419,48 @@ def metrics(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> dict:
     rets = daily / eq_daily.shift(1).fillna(START_EQUITY)
     sharpe = float(rets.mean() / rets.std() * np.sqrt(252)) if rets.std() > 0 else 0.0
     r = df.R.to_numpy()
-    t_stat = float(r.mean() / (r.std(ddof=1) / np.sqrt(len(r)))) if len(r) > 1 else 0.0
+    rl, rs = df.R[df.dir == 1].to_numpy(), df.R[df.dir == -1].to_numpy()
     return dict(trades=len(df), win_rate=float((df.pnl_usd > 0).mean()),
                 profit_factor=float(wins / losses) if losses > 0 else float("inf"),
-                avg_R=float(r.mean()), t_stat_R=t_stat, net_profit=final - START_EQUITY,
+                avg_R=float(r.mean()), t_stat_R=_t(r), net_profit=final - START_EQUITY,
                 cagr=cagr, max_dd=max_dd, sharpe=sharpe,
-                capped=int(df.capped.sum()))
+                n_long=len(rl), avg_R_long=float(rl.mean()) if len(rl) else float("nan"),
+                n_short=len(rs), avg_R_short=float(rs.mean()) if len(rs) else float("nan"),
+                worst_R=float(r.min()), capped=int(df.capped.sum()))
 
 
 def survives(m: dict) -> bool:
     return m.get("trades", 0) >= 100 and m["profit_factor"] > 1.15 and m["max_dd"] < 0.25
+
+
+def pooled(trades: pd.DataFrame) -> pd.DataFrame:
+    """Per session, all symbols together. Trades on the same day are
+    correlated across symbols, so R is first averaged per (session, day) and
+    the t-stat is computed on those daily means. 12 symbol x session cells
+    were tested: a single cell needs |t| > 2.87 for 5% family-wise
+    (Bonferroni, two-sided); a session pool (3 tests) needs |t| > 2.39."""
+    rows = []
+    for sess, g in trades.groupby("session"):
+        daily = g.groupby("day")["R"].mean().to_numpy()
+        rows.append(dict(session=sess, trades=len(g), days=len(daily),
+                         avg_R=float(g.R.mean()), t_stat_daily_clustered=_t(daily),
+                         win_rate=float((g.R > 0).mean())))
+    return pd.DataFrame(rows)
+
+
+def entry_timing(trades: pd.DataFrame, bar_min: int) -> pd.DataFrame:
+    """Entries on the first bar after the range (e.g. the 08:30 New York data
+    releases) versus later ones."""
+    early = _first_bar(trades, max(bar_min, 5))
+    g = trades.groupby([trades.symbol, trades.session,
+                        early.rename(f"first_{max(bar_min, 5)}_min")])["R"]
+    return g.agg(trades="count", avg_R="mean").reset_index()
+
+
+def _yearly(trades: pd.DataFrame) -> pd.DataFrame:
+    y = pd.to_datetime(trades.t_in, utc=True).dt.year
+    g = trades.groupby([trades.symbol, trades.session, y.rename("year")])["R"]
+    return g.agg(trades="count", avg_R="mean", sum_R="sum").reset_index()
 
 
 # --------------------------------------------------------------------------
@@ -375,7 +468,11 @@ def survives(m: dict) -> bool:
 # --------------------------------------------------------------------------
 
 def load_raw(files) -> pd.DataFrame:
-    df = pd.concat([read_mt5_csv(f) for f in files]).sort_index()
+    parts = [read_mt5_csv(f) for f in files]
+    sizes = {bar_minutes(p.index, f.name) for p, f in zip(parts, files)}
+    if len(sizes) != 1:
+        raise ValueError(f"mixed bar sizes {sorted(sizes)} in {[f.name for f in files]}")
+    df = pd.concat(parts).sort_index(kind="stable")
     return df[~df.index.duplicated(keep="first")]
 
 
@@ -394,20 +491,28 @@ def resolve_server_tz(raw: dict[str, pd.DataFrame], override: str | None):
 
 
 def load_symbol(df: pd.DataFrame, tz: str):
+    """Convert to UTC, drop bad rows, add raw and conservative spreads."""
+    bad = df[["open", "high", "low", "close", "spread"]].isna().any(axis=1) \
+        | (df.high < df.low) | (df.spread < 0)
+    n_bad = int(bad.sum())
+    df = df[~bad]
     point = infer_point(np.concatenate([df.open.to_numpy(), df.close.to_numpy()]))
     df = df.copy()
     df.index = server_to_utc(df.index, tz)
     dropped = int(df.index.isna().sum())
-    df = df[~df.index.isna()].sort_index()
+    df = df[~df.index.isna()].sort_index(kind="stable")
     df = df[~df.index.duplicated(keep="first")]
     df["spread_px"] = df.spread * point
-    return df, point, dropped
+    df["spread_cons"] = conservative_spread(df.spread_px)
+    return df, point, dropped, n_bad
 
 
-def to_bars(df: pd.DataFrame) -> Bars:
-    return Bars(t=df.index.as_unit("ns").asi8, o=df.open.to_numpy(float),
+def to_bars(df: pd.DataFrame, col: str = "spread_cons") -> Bars:
+    t = df.index.as_unit("ns").asi8
+    return Bars(t=t, o=df.open.to_numpy(float),
                 h=df.high.to_numpy(float), l=df.low.to_numpy(float),
-                c=df.close.to_numpy(float), sp=df.spread_px.to_numpy(float))
+                c=df.close.to_numpy(float), sp=df[col].to_numpy(float),
+                bar_ns=int(np.median(np.diff(t))) if len(t) > 1 else 60_000_000_000)
 
 
 def trading_days(df: pd.DataFrame, sess: Session):
@@ -416,75 +521,18 @@ def trading_days(df: pd.DataFrame, sess: Session):
     return [d for d in days if pd.Timestamp(d).dayofweek < 5]
 
 
-def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | None,
-        server_tz: str | None) -> pd.DataFrame:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    files: dict[str, list[pathlib.Path]] = {}
-    for f in sorted(data_dir.glob("*.csv")):
-        s = symbol_of(f)
-        if s:
-            files.setdefault(s, []).append(f)
-    if not files:
-        sys.exit(f"no MT5 CSV files for {SYMBOLS} found in {data_dir}")
-    rows, all_trades, notes = [], [], []
-    raw = {sym: load_raw(fl) for sym, fl in files.items()}
-    tz, found = resolve_server_tz(raw, server_tz)
-    notes.append(f"broker server timezone: {tz} "
-                 + (f"(detected; share of FX weekly opens at Sunday 17:xx NY: "
-                    + ", ".join(f"{s} {sc:.1%}" for s, (_, sc) in found.items()) + ")"
-                    if found else "(given with --server-tz)"))
-    for sym, fl in files.items():
-        df, point, dropped = load_symbol(raw.pop(sym), tz)
-        lo_t = pd.Timestamp(start, tz="UTC")
-        hi_t = pd.Timestamp(end, tz="UTC") if end else df.index.max()
-        df = df[(df.index >= lo_t) & (df.index <= hi_t)]
-        notes.append(f"{sym}: {len(fl)} file(s), {len(df):,} M1 bars, "
-                     f"{df.index.min()} -> {df.index.max()}, point={point:g}, "
-                     f"{dropped} bars dropped at DST switches, "
-                     f"median spread={df.spread_px.median() / SPEC[sym]['pip']:.2f} pips")
-        bars = to_bars(df)
-        span = (df.index.min(), df.index.max())
-        for sess in SESSIONS:
-            days = trading_days(df, sess)
-            for label, mult, costs in (("net", 1.0, True), ("net_2x_spread", 2.0, True),
-                                       ("gross", 1.0, False)):
-                tr, skipped = simulate_session(bars, sym, sess, days, spread_mult=mult,
-                                               costs=costs)
-                scored = size_and_score(tr, sym, costs=costs)
-                m = metrics(scored, span[0].tz_localize(None), span[1].tz_localize(None))
-                rows.append(dict(symbol=sym, session=sess.name, case=label,
-                                 days=len(days), skipped_days=skipped, **m,
-                                 survives_gate=survives(m) if m.get("trades") else False))
-                if label == "net" and not scored.empty:
-                    all_trades.append(scored)
-    res = pd.DataFrame(rows)
-    res.to_csv(out_dir / "orb_metrics.csv", index=False)
-    if all_trades:
-        trades = pd.concat(all_trades, ignore_index=True)
-        trades.to_csv(out_dir / "orb_trades_net.csv", index=False)
-        _yearly(trades).to_csv(out_dir / "orb_by_year.csv", index=False)
-        _pooled(trades).to_csv(out_dir / "orb_pooled_by_session.csv", index=False)
-        _plot(trades, out_dir / "orb_cum_R.png")
-    (out_dir / "data_notes.txt").write_text("\n".join(notes) + "\n")
-    return res
-
-
-def _yearly(trades: pd.DataFrame) -> pd.DataFrame:
-    y = pd.to_datetime(trades.t_in, utc=True).dt.year
-    g = trades.groupby([trades.symbol, trades.session, y.rename("year")])["R"]
-    return g.agg(trades="count", avg_R="mean", sum_R="sum").reset_index()
-
-
-def _pooled(trades: pd.DataFrame) -> pd.DataFrame:
-    """Per session, all symbols together, in R. Bonferroni: 12 symbol x session
-    cells were tested, so a cell needs |t| > 2.87 for 5% family-wise two-sided."""
-    rows = []
-    for sess, g in trades.groupby("session"):
-        r = g.R.to_numpy()
-        rows.append(dict(session=sess, trades=len(r), avg_R=r.mean(),
-                         t_stat_R=r.mean() / (r.std(ddof=1) / np.sqrt(len(r))),
-                         win_rate=(r > 0).mean()))
-    return pd.DataFrame(rows)
+def _spread_note(df: pd.DataFrame, sym: str) -> str:
+    pip = SPEC[sym]["pip"]
+    raw, cons = df.spread_px / pip, df.spread_cons / pip
+    q = lambda s: "/".join(f"{s.quantile(x):.2f}" for x in (0.5, 0.9, 0.99))
+    parts = [f"spread in pips p50/p90/p99: raw {q(raw)}, conservative {q(cons)}; "
+             f"bars with zero spread {float((df.spread == 0).mean()):.1%}"]
+    for sess in SESSIONS:
+        loc = df.index.tz_convert(sess.tz)
+        hhmm = loc.strftime("%H:%M")
+        w = (hhmm >= sess.range_start) & (hhmm < sess.exit)
+        parts.append(f"{sess.name} window raw p50/p90/p99 {q(raw[w])}")
+    return "; ".join(parts)
 
 
 def _plot(trades: pd.DataFrame, path: pathlib.Path) -> None:
@@ -507,6 +555,64 @@ def _plot(trades: pd.DataFrame, path: pathlib.Path) -> None:
     plt.close(fig)
 
 
+def run(data_dir: pathlib.Path, out_dir: pathlib.Path, start: str, end: str | None,
+        server_tz: str | None) -> pd.DataFrame:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files: dict[str, list[pathlib.Path]] = {}
+    for f in sorted(data_dir.glob("*.csv")):
+        s = symbol_of(f)
+        if s:
+            files.setdefault(s, []).append(f)
+    if not files:
+        sys.exit(f"no MT5 CSV files for {SYMBOLS} found in {data_dir}")
+    rows, all_trades, notes = [], [], []
+    raw = {sym: load_raw(fl) for sym, fl in files.items()}
+    sizes = {sym: bar_minutes(df.index, sym) for sym, df in raw.items()}
+    if len(set(sizes.values())) != 1:
+        sys.exit(f"all symbols must use the same bar size, got {sizes}")
+    tz, found = resolve_server_tz(raw, server_tz)
+    notes.append(f"broker server timezone: {tz} "
+                 + (f"(detected; share of FX weekly opens at Sunday 17:xx NY: "
+                    + ", ".join(f"{s} {sc:.1%}" for s, (_, sc) in found.items()) + ")"
+                    if found else "(given with --server-tz)"))
+    for sym, fl in files.items():
+        df, point, dropped, n_bad = load_symbol(raw.pop(sym), tz)
+        lo_t = pd.Timestamp(start, tz="UTC")
+        hi_t = pd.Timestamp(end, tz="UTC") if end else df.index.max()
+        df = df[(df.index >= lo_t) & (df.index <= hi_t)]
+        notes.append(f"{sym}: {len(fl)} file(s), {len(df):,} bars, "
+                     f"{df.index.min()} -> {df.index.max()}, point={point:g}, "
+                     f"{n_bad} bad rows dropped (NaN, high<low, negative spread), "
+                     f"{dropped} bars dropped at DST switches, "
+                     f"bar size M{bar_minutes(df.index)}; " + _spread_note(df, sym))
+        bars = to_bars(df)
+        bar_min = bars.bar_ns // 60_000_000_000
+        span = (df.index.min().tz_localize(None), df.index.max().tz_localize(None))
+        for sess in SESSIONS:
+            days = trading_days(df, sess)
+            for label, costs, stress in CASES:
+                tr, st = simulate_session(bars, sym, sess, days, costs=costs, stress=stress)
+                scored = size_and_score(tr, sym, costs=costs)
+                m = metrics(scored, *span)
+                rows.append(dict(symbol=sym, session=sess.name, case=label,
+                                 days=len(days), **st, **m,
+                                 survives_gate=(survives(m) if label == "net"
+                                                and m.get("trades") else None)))
+                if label == "net" and not scored.empty:
+                    all_trades.append(scored)
+    res = pd.DataFrame(rows)
+    res.to_csv(out_dir / "orb_metrics.csv", index=False)
+    if all_trades:
+        trades = pd.concat(all_trades, ignore_index=True)
+        trades.to_csv(out_dir / "orb_trades_net.csv", index=False)
+        _yearly(trades).to_csv(out_dir / "orb_by_year.csv", index=False)
+        pooled(trades).to_csv(out_dir / "orb_pooled_by_session.csv", index=False)
+        entry_timing(trades, bar_min).to_csv(out_dir / "orb_entry_timing.csv", index=False)
+        _plot(trades, out_dir / "orb_cum_R.png")
+    (out_dir / "data_notes.txt").write_text("\n".join(notes) + "\n")
+    return res
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--data", type=pathlib.Path, default=pathlib.Path("data/mt5"))
@@ -517,7 +623,7 @@ def main(argv=None) -> None:
                    help="override detection, e.g. NY+7, Europe/Helsinki, Etc/GMT-2")
     a = p.parse_args(argv)
     res = run(a.data, a.out, a.start, a.end, a.server_tz)
-    pd.set_option("display.width", 200)
+    pd.set_option("display.width", 250)
     print(res.round(3).to_string(index=False))
 
 
