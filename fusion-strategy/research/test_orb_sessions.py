@@ -212,6 +212,13 @@ class TestTradeRules(unittest.TestCase):
         s = orb.size_and_score([t], "EURUSD").iloc[0]
         self.assertLess(s.R, -2.0)                        # sized on the level, gap loses > 1R
 
+    def test_short_gap_entry_fills_at_open(self):
+        df, local = london_day()
+        set_bar(df, local, 9, 0, open=1.0975, high=1.0976, low=1.0974, close=1.0975)
+        (t,), _ = sim(df)
+        self.assertEqual(t["dir"], -1)
+        self.assertAlmostEqual(t["entry"], 1.0974)        # bid open 1.0975 - slip
+
     def test_short_gap_stop_fills_at_ask_open(self):
         df, local = london_day()
         set_bar(df, local, 9, 0, low=1.0988)
