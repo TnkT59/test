@@ -4,9 +4,12 @@ out-of-sample with the default parameters unchanged (PLAN.md sections 4-5).
     python scripts/phase3.py --data data/mt5 --out results/phase3
 
 Stops (exit code 2) before any backtest when:
-  * a symbol is missing more than 1% of trading hours (Phase 1 rule);
-  * there is no in-sample data (nothing before 2022);
-  * swap is not set in config/costs.toml (overnight holds need it);
+  * a symbol has unexplained data gaps above 1% of trading hours (Phase 1);
+  * there is no in-sample data;
+  * swap is not set in config/costs.toml (overnight holds need it), unless
+    --swap-missing exclude is given: then swap is left out, every cell with
+    overnight holds is marked "provisional", and its verdict is not final.
+--split plan (2015-2021 / 2022-2024) or available (2023 / 2024).
 Data from 2025 on is dropped at load (holdout).
 """
 from __future__ import annotations
@@ -25,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from fusion.data import mt5, quality                              # noqa: E402
 from fusion.data.resample import resample                         # noqa: E402
-from fusion.data.splits import IN_SAMPLE, OUT_OF_SAMPLE, cap_before_holdout  # noqa: E402
+from fusion.data.splits import cap_before_holdout, split          # noqa: E402
 from fusion.engine.backtest import SwapUnknown, run_backtest      # noqa: E402
 from fusion.engine.costs import CONFIG, load_costs                # noqa: E402
 from fusion.engine.metrics import summarize, survives             # noqa: E402
@@ -69,19 +72,26 @@ def pooled(rows: pd.DataFrame, trades: dict) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def verdict(r) -> str:
+    if r.survives:
+        return "**yes (provisional: no swap)**" if r.provisional else "**yes**"
+    return "no (provisional: no swap)" if r.provisional else "no"
+
+
 def survivor_table(rows: pd.DataFrame) -> str:
     oos = rows[rows.period == "OOS"].copy()
     ins = rows[rows.period == "IS"].set_index(["strategy", "tf", "symbol"])
     lines = ["| Strategy | TF | Symbol | IS PF | IS trades | OOS net profit | OOS CAGR | OOS max DD | "
              "OOS Sharpe | OOS PF | OOS win rate | OOS avg R | OOS trades | Survives |",
              "|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|:-:|"]
+    fmt = lambda x, f: "n/a" if x != x else format(x, f)
     for _, r in oos.sort_values(["strategy", "tf", "symbol"]).iterrows():
         i = ins.loc[(r.strategy, r.tf, r.symbol)]
         lines.append(
-            f"| {r.strategy} | {r.tf} | {r.symbol} | {i.profit_factor:.2f} | {int(i.trades)} | "
+            f"| {r.strategy} | {r.tf} | {r.symbol} | {fmt(i.profit_factor, '.2f')} | {int(i.trades)} | "
             f"{r.net_profit:,.0f} | {r.cagr:+.1%} | {r.max_dd:.1%} | {r.sharpe:.2f} | "
-            f"{r.profit_factor:.2f} | {r.win_rate:.0%} | {r.avg_R:+.3f} | {int(r.trades)} | "
-            f"{'**yes**' if r.survives else 'no'} |")
+            f"{fmt(r.profit_factor, '.2f')} | {fmt(r.win_rate, '.0%')} | {fmt(r.avg_R, '+.3f')} | "
+            f"{int(r.trades)} | {verdict(r)} |")
     return "\n".join(lines)
 
 
@@ -93,6 +103,8 @@ def main(argv=None) -> None:
     ap.add_argument("--strategies", default="", help="comma-separated ids (default: all)")
     ap.add_argument("--costs", type=pathlib.Path, default=CONFIG)
     ap.add_argument("--server-tz", default=None)
+    ap.add_argument("--split", choices=("plan", "available"), default="plan")
+    ap.add_argument("--swap-missing", choices=("stop", "exclude"), default="stop")
     a = ap.parse_args(argv)
     symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
     sids = [s.strip() for s in a.strategies.split(",") if s.strip()] or list(STRATEGIES)
@@ -108,11 +120,13 @@ def main(argv=None) -> None:
     bad = [r["symbol"] for r in reps if r["stop"]]
     if bad:
         stop(f"more than 1% of trading hours missing for {bad} (see phase1_quality.md)")
+    IN_SAMPLE, OUT_OF_SAMPLE = split(a.split)
     first = {s: b.index[0] for s, b in bars.items()}
     if any(f >= IN_SAMPLE[1] for f in first.values()):
-        stop(f"no in-sample data: first bars {first}; in-sample is 2015-2021")
+        stop(f"no in-sample data: first bars {first}; in-sample is "
+             f"{IN_SAMPLE[0].date()} to {IN_SAMPLE[1].date()}")
     unknown = [s for s in symbols if not costs[s].swap_known()]
-    if unknown:
+    if unknown and a.swap_missing == "stop":
         stop(f"swap not set in {a.costs} for {unknown}: copy swap long/short (points) and the "
              "3-day swap weekday from MT5 Symbol -> Specification")
 
@@ -126,11 +140,17 @@ def main(argv=None) -> None:
                 coarse = mids[sym] if tf == "M15" else resample(mids[sym], tf)
                 sig = spec.run(coarse)
                 for name, per in (("IS", IN_SAMPLE), ("OOS", OUT_OF_SAMPLE)):
-                    res = run_backtest(sig, bars[sym], costs[sym], period=per)
+                    no_swap = sym in unknown
+                    res = run_backtest(sig, bars[sym], costs[sym], period=per,
+                                       allow_missing_swap=no_swap)
                     start = max(per[0], first[sym].floor("D"))
                     m = summarize(res.trades, res.equity, START_EQUITY, (start, per[1]), res.exposure)
+                    nights = int(res.trades.nights.sum()) if len(res.trades) else 0
                     m.update(strategy=sid, tf=tf, symbol=sym, period=name, period_start=str(start),
-                             survives=survives(m) if name == "OOS" else None, **res.counts)
+                             survives=survives(m) if name == "OOS" else None,
+                             overnight_trades=int((res.trades.nights > 0).sum()) if len(res.trades) else 0,
+                             swap_nights=nights, swap_included=not no_swap,
+                             provisional=bool(no_swap and nights > 0), **res.counts)
                     rows.append(m)
                     trades[(sid, tf, sym, name)] = res.trades.assign(
                         strategy=sid, tf=tf, symbol=sym, period=name)
@@ -142,11 +162,16 @@ def main(argv=None) -> None:
     pooled(df, trades).to_csv(a.out / "phase3_pooled.csv", index=False)
     table = survivor_table(df)
     (a.out / "survivors.md").write_text(table + "\n")
-    n_surv = int(df[(df.period == "OOS")].survives.sum())
-    cells = len(df[df.period == "OOS"])
+    oos = df[df.period == "OOS"]
+    n_surv = int(oos.survives.sum())
+    n_prov = int((oos.survives & oos.provisional).sum())
+    cells = len(oos)
     print(table)
-    print(f"\n✅ Phase 3 — {cells} strategy x timeframe x symbol cells run in-sample and "
-          f"out-of-sample — {n_surv} survive (OOS PF > 1.15, >= 100 trades, max DD < 25%) — "
+    print(f"\n✅ Phase 3 — {cells} strategy x timeframe x symbol cells run in-sample "
+          f"({IN_SAMPLE[0].date()}..{IN_SAMPLE[1].date()}) and out-of-sample "
+          f"({OUT_OF_SAMPLE[0].date()}..{OUT_OF_SAMPLE[1].date()}) — {n_surv} survive "
+          f"(OOS PF > 1.15, >= 100 trades, max DD < 25%), {n_prov} of them provisional "
+          f"(swap not included) — "
           f"{'STOP: nothing survived' if n_surv == 0 else 'next: show you the survivor table'}")
 
 

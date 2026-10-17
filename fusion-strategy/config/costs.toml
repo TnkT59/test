@@ -48,3 +48,28 @@ commission = "per_notional"
 swap_long = nan
 swap_short = nan
 triple_swap_day = "Wednesday"
+
+# US index CFDs (added 2026-10-18 for the run on the data you supplied).
+# Contract size, slippage and commission are assumptions, not your broker's
+# confirmed values: 1 unit per lot (R, profit factor and win rate do not
+# depend on it), slippage 1 point USTEC / 2 points US30 per fill, $7 per
+# $100k notional, 20:1 leverage cap.
+[USTEC]
+lot = 1
+pip = 1.0
+slip = 1.0
+max_lev = 20.0
+commission = "per_notional"
+swap_long = nan
+swap_short = nan
+triple_swap_day = "Friday"
+
+[US30]
+lot = 1
+pip = 1.0
+slip = 2.0
+max_lev = 20.0
+commission = "per_notional"
+swap_long = nan
+swap_short = nan
+triple_swap_day = "Friday"

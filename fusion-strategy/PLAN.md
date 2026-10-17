@@ -234,4 +234,10 @@ Count: 8 × 4 + 1 + 4 × 2 + 1 = **42 strategy-timeframe cells × 4 symbols = 16
   - **Resolution:** intrabar events are resolved on M15 rather than M1. The measured bias is −0.006 to −0.008R per trade, so it is slightly pessimistic.
   - **Swap:** the swap table in `config/costs.toml` must be filled from your broker's Symbol → Specification before Phase 3 runs. The runner stops otherwise.
   - **Config format:** `config/*.yaml` became `config/costs.toml`, because PyYAML is not an allowed dependency and Python reads TOML natively.
+- **2026-10-18. Phase 3 on the data you supplied, on your instruction ("use the symbols available and only the dates you have").**
+  - **Symbols:** XAUUSD, USDJPY, USTEC and US30. EURUSD and GBPUSD are not in the data.
+  - **Split:** in-sample 2023, out-of-sample 2024. **The holdout stays 2025-01-01 onward, sealed for Phase 5.** One year per window is short: most H4/D1 cells cannot reach 100 out-of-sample trades.
+  - **Swap:** not yet supplied. Cells with overnight holds run without swap and are marked *provisional*. Same-day strategies (S1, S2, P1, P2, V2) need none.
+  - **Index assumptions:** contract settings for USTEC/US30 are assumptions; see `config/costs.toml`.
+  - **Phase 1 calendar:** every missing hour in the data falls on a US market holiday or early close, so those are reported as scheduled closures. The 1% STOP rule applies to unexplained gaps, of which there are none.
 

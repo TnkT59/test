@@ -91,6 +91,20 @@ class TestPhase3Runner(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("swap not set", out)
 
+    def test_swap_excluded_marks_overnight_cells_provisional(self):
+        write_export(self.d / "data" / "EURUSD_M15.csv", "2021-09-01", 210, seed=5)
+        args = self.base("--strategies", "T2,S2", "--swap-missing", "exclude")
+        args[args.index("--costs") + 1] = str(ROOT / "config" / "costs.toml")   # swaps unset
+        code, out = run(args)
+        self.assertEqual(code, 0, out)
+        m = pd.read_csv(self.d / "out" / "phase3_metrics.csv")
+        self.assertFalse(m.swap_included.any())
+        t2 = m[(m.strategy == "T2") & (m.tf == "H1")]
+        self.assertTrue((t2.swap_nights > 0).all() and t2.provisional.all())
+        s2 = m[m.strategy == "S2"]
+        self.assertTrue((s2.swap_nights == 0).all() and not s2.provisional.any())
+        self.assertIn("provisional", (self.d / "out" / "survivors.md").read_text())
+
     def test_stops_without_in_sample_data(self):
         write_export(self.d / "data" / "EURUSD_M15.csv", "2022-02-01", 60, seed=3)
         code, out = run(self.base("--strategies", "T1"))
